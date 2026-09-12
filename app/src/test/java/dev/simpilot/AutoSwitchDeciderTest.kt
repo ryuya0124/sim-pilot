@@ -2,6 +2,7 @@ package dev.simpilot
 
 import org.junit.Assert.assertFalse
 import org.junit.Assert.assertNotEquals
+import org.junit.Assert.assertEquals
 import org.junit.Assert.assertTrue
 import org.junit.Test
 
@@ -18,6 +19,27 @@ class AutoSwitchDeciderTest {
 
     @Test fun unvalidatedNetworkFails() {
         assertTrue(AutoSwitchDecider.isBad(QualitySample(true, 4, false, null, null), config))
+    }
+
+    @Test fun validatedNetworkWithTemporaryProbeFailureIsInconclusive() {
+        assertEquals(
+            QualityVerdict.INCONCLUSIVE,
+            AutoSwitchDecider.evaluate(QualitySample(true, 3, true, null, null), config),
+        )
+    }
+
+    @Test fun goodSpeedCompensatesForMissingLatencyProbe() {
+        assertEquals(
+            QualityVerdict.GOOD,
+            AutoSwitchDecider.evaluate(QualitySample(true, 3, true, null, 2_000), config),
+        )
+    }
+
+    @Test fun slowSpeedStillFailsWhenLatencyProbeIsMissing() {
+        assertEquals(
+            QualityVerdict.BAD,
+            AutoSwitchDecider.evaluate(QualitySample(true, 3, true, null, 200), config),
+        )
     }
 
     @Test fun wifiRestoreKeepsBackgroundServiceAliveIndependently() {

@@ -165,8 +165,13 @@ class MonitorService : Service() {
         val speed = if (shouldMeasureSpeed) cellularNetwork?.let(::speedProbe) else null
         Log.i(TAG, "probe subId=$dataSubId network=$cellularNetwork validated=$validated latencyMs=$latency speedKbps=$speed")
         val sample = QualitySample(current.inService, current.signalLevel, validated, latency, speed)
-        val bad = AutoSwitchDecider.isBad(sample, config)
-        badSamples = if (bad) badSamples + 1 else 0
+        val verdict = AutoSwitchDecider.evaluate(sample, config)
+        val bad = verdict == QualityVerdict.BAD
+        badSamples = when (verdict) {
+            QualityVerdict.BAD -> badSamples + 1
+            QualityVerdict.GOOD -> 0
+            QualityVerdict.INCONCLUSIVE -> badSamples
+        }
 
         AppState.update {
             it.copy(lastLatencyMs = latency, lastSpeedKbps = speed, badSamples = badSamples)
@@ -186,9 +191,17 @@ class MonitorService : Service() {
         val detail = buildString {
             append(current.title)
             append(" · ")
-            append(latency?.let { "${it}ms" } ?: "応答なし")
+            append(
+                when {
+                    latency != null -> "${latency}ms"
+                    speed != null -> "遅延測定保留"
+                    validated -> "疎通確認済み · 測定保留"
+                    else -> "通信未検証"
+                }
+            )
             speed?.let { append(" · ${it}kbps") }
             if (badSamples > 0) append(" · 低品質 $badSamples/${config.consecutiveFailures}")
+            if (verdict == QualityVerdict.INCONCLUSIVE) append(" · 次回再測定")
             if (inCall) append(" · 通話中は切替保留")
             else if (inCooldown && bad) append(" · クールダウン中")
         }
@@ -277,13 +290,18 @@ class MonitorService : Service() {
     }
 
     private fun latencyProbe(network: Network): Long? {
-        val url = URL(LATENCY_URL)
+        val url = URL(LATENCY_URLS.first())
         val bound = latencyAttempt { network.openConnection(url) as HttpURLConnection }
         if (bound.isSuccess) return bound.getOrNull()
         Log.i(TAG, "direct probe unavailable on $network; using the app default route")
-        return latencyAttempt { url.openConnection() as HttpURLConnection }
-            .onFailure { Log.w(TAG, "default-route latency probe failed: ${it.message}", it) }
-            .getOrNull()
+        var lastFailure: Throwable? = null
+        LATENCY_URLS.forEach { endpoint ->
+            val result = latencyAttempt { URL(endpoint).openConnection() as HttpURLConnection }
+            if (result.isSuccess) return result.getOrNull()
+            lastFailure = result.exceptionOrNull()
+        }
+        Log.w(TAG, "all latency probes failed: ${lastFailure?.message}", lastFailure)
+        return null
     }
 
     private fun latencyAttempt(open: () -> HttpURLConnection): Result<Long> = runCatching {
@@ -383,7 +401,11 @@ class MonitorService : Service() {
         private const val CHANNEL_ID = "sim_pilot_monitor"
         private const val TAG = "SimPilotMonitor"
         private const val NOTIFICATION_ID = 6201
-        private const val LATENCY_URL = "https://connectivitycheck.gstatic.com/generate_204"
+        private val LATENCY_URLS = listOf(
+            "https://connectivitycheck.gstatic.com/generate_204",
+            "https://www.google.com/generate_204",
+            "https://speed.cloudflare.com/__down?bytes=1",
+        )
         private const val SPEED_URL = "https://speed.cloudflare.com/__down?bytes=65536"
         const val ACTION_STOP = "dev.simpilot.STOP"
         const val ACTION_TEST_NOW = "dev.simpilot.TEST_NOW"
