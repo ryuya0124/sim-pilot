@@ -15,7 +15,11 @@ import androidx.core.content.ContextCompat
 import java.util.concurrent.ConcurrentHashMap
 import java.util.concurrent.Executor
 
-class SimRepository(private val context: Context, private val executor: Executor) {
+class SimRepository(
+    private val context: Context,
+    private val executor: Executor,
+    private val onRadioChanged: ((event: String, subId: Int) -> Unit)? = null,
+) {
     private val subscriptionManager = context.getSystemService(SubscriptionManager::class.java)
     private val telephonyManager = context.getSystemService(TelephonyManager::class.java)
     private val callbacks = ConcurrentHashMap<Int, LineCallback>()
@@ -27,38 +31,74 @@ class SimRepository(private val context: Context, private val executor: Executor
         val inService: Boolean = false,
         val serviceStateKnown: Boolean = false,
         val networkType: String = "—",
+        val dataConnectionState: Int = -1,
+        val callState: Int = -1,
     )
 
     private inner class LineCallback(private val subId: Int) : TelephonyCallback(),
         TelephonyCallback.SignalStrengthsListener,
         TelephonyCallback.ServiceStateListener,
-        TelephonyCallback.DisplayInfoListener {
+        TelephonyCallback.DisplayInfoListener,
+        TelephonyCallback.DataConnectionStateListener,
+        TelephonyCallback.CallStateListener {
 
         override fun onSignalStrengthsChanged(signalStrength: SignalStrength) {
             val dbm = if (Build.VERSION.SDK_INT >= 29) {
                 signalStrength.cellSignalStrengths.firstOrNull()?.dbm
             } else null
+            var levelChanged = false
             observations.compute(subId) { _, old ->
-                (old ?: Observation()).copy(level = signalStrength.level, dbm = dbm)
+                val next = (old ?: Observation()).copy(level = signalStrength.level, dbm = dbm)
+                levelChanged = old == null || old.level != next.level
+                next
             }
             publish()
+            if (levelChanged) onRadioChanged?.invoke("signal_level", subId)
         }
 
         override fun onServiceStateChanged(serviceState: ServiceState) {
+            var stateChanged = false
             observations.compute(subId) { _, old ->
-                (old ?: Observation()).copy(
+                val next = (old ?: Observation()).copy(
                     inService = serviceState.state == ServiceState.STATE_IN_SERVICE,
                     serviceStateKnown = true,
                 )
+                stateChanged = old == null || old.inService != next.inService || !old.serviceStateKnown
+                next
             }
             publish()
+            if (stateChanged) onRadioChanged?.invoke("service_state", subId)
         }
 
         override fun onDisplayInfoChanged(info: TelephonyDisplayInfo) {
+            var typeChanged = false
             observations.compute(subId) { _, old ->
-                (old ?: Observation()).copy(networkType = networkLabel(info))
+                val next = (old ?: Observation()).copy(networkType = networkLabel(info))
+                typeChanged = old == null || old.networkType != next.networkType
+                next
             }
             publish()
+            if (typeChanged) onRadioChanged?.invoke("network_type", subId)
+        }
+
+        override fun onDataConnectionStateChanged(state: Int, networkType: Int) {
+            var stateChanged = false
+            observations.compute(subId) { _, old ->
+                val next = (old ?: Observation()).copy(dataConnectionState = state)
+                stateChanged = old == null || old.dataConnectionState != next.dataConnectionState
+                next
+            }
+            if (stateChanged) onRadioChanged?.invoke("data_connection", subId)
+        }
+
+        override fun onCallStateChanged(state: Int) {
+            var stateChanged = false
+            observations.compute(subId) { _, old ->
+                val next = (old ?: Observation()).copy(callState = state)
+                stateChanged = old == null || old.callState != next.callState
+                next
+            }
+            if (stateChanged) onRadioChanged?.invoke("call_state", subId)
         }
     }
 

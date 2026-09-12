@@ -11,12 +11,15 @@ class BootReceiver : BroadcastReceiver() {
         if (action !in setOf(
                 Intent.ACTION_BOOT_COMPLETED,
                 Intent.ACTION_LOCKED_BOOT_COMPLETED,
-                Intent.ACTION_USER_UNLOCKED,
                 Intent.ACTION_MY_PACKAGE_REPLACED,
             )) return
 
-        val config = AppPreferences(context).load()
+        val preferences = AppPreferences(context)
+        val config = preferences.load()
         val unlocked = context.getSystemService(UserManager::class.java).isUserUnlocked
+        val forceCheck = unlocked &&
+            action == Intent.ACTION_BOOT_COMPLETED &&
+            preferences.claimUnlockCheck()
         DiagnosticLog.info(
             context,
             "system_event",
@@ -27,10 +30,11 @@ class BootReceiver : BroadcastReceiver() {
                 "monitorEnabled" to config.enabled,
                 "wifiRestoreEnabled" to config.wifiRestoreEnabled,
                 "shizukuReady" to ShizukuBridge.isReady(),
+                "forceCheck" to forceCheck,
             ),
         )
         if (config.needsService()) {
-            runCatching { MonitorService.start(context, reason = "system:$action") }
+            runCatching { MonitorService.start(context, testNow = forceCheck, reason = "system:$action") }
                 .onSuccess {
                     DiagnosticLog.info(context, "service_start_requested", "システムイベントから監視開始を要求")
                 }

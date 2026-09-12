@@ -91,7 +91,15 @@ class AppPreferences(context: Context) {
             .apply()
     }
 
+    fun claimUnlockCheck(now: Long = System.currentTimeMillis()): Boolean = synchronized(unlockCheckLock) {
+        val last = prefs.getLong("last_unlock_check", 0L)
+        if (now - last in 0 until UNLOCK_DEDUP_MS) return false
+        prefs.edit().putLong("last_unlock_check", now).commit()
+    }
+
     companion object {
         private const val PREFS_NAME = "sim_pilot"
+        private const val UNLOCK_DEDUP_MS = 5_000L
+        private val unlockCheckLock = Any()
     }
 }

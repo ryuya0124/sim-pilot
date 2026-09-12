@@ -22,6 +22,7 @@ import android.os.Build
 import android.os.Handler
 import android.os.IBinder
 import android.os.Looper
+import android.os.SystemClock
 import android.os.UserManager
 import android.provider.Settings
 import android.telecom.TelecomManager
@@ -44,17 +45,34 @@ class MonitorService : Service() {
     private lateinit var switchAudit: SwitchAudit
     private lateinit var sims: SimRepository
     private lateinit var connectivity: ConnectivityManager
+    private lateinit var subscriptionManager: SubscriptionManager
     private var badSamples = 0
     private var sampleCount = 0
     private var networkCallbackRegistered = false
+    private var subscriptionListenerRegistered = false
     private var settingsObserverRegistered = false
+    private var unlockReceiverRegistered = false
     private var shizukuListenersRegistered = false
+    private var scheduledAtElapsed = Long.MAX_VALUE
     @Volatile private var backendInfo: SwitchBackendInfo? = null
     private val stopped = AtomicBoolean(false)
+    private val cycleInFlight = AtomicBoolean(false)
+    private val rerunRequested = AtomicBoolean(false)
+    private val forceDeepProbeRequested = AtomicBoolean(false)
+    private val scheduledCycle = Runnable {
+        scheduledAtElapsed = Long.MAX_VALUE
+        if (!stopped.get()) enqueueCycle(forceDeepProbe = false)
+    }
     private val networkCallback = object : ConnectivityManager.NetworkCallback() {
-        override fun onAvailable(network: Network) = scheduleNext(250)
-        override fun onLost(network: Network) = scheduleNext(250)
-        override fun onCapabilitiesChanged(network: Network, networkCapabilities: NetworkCapabilities) = scheduleNext(250)
+        override fun onAvailable(network: Network) = requestRealtimeCheck("network_available", 250)
+        override fun onLost(network: Network) = requestRealtimeCheck("network_lost", 250)
+        override fun onCapabilitiesChanged(network: Network, networkCapabilities: NetworkCapabilities) =
+            requestRealtimeCheck("network_capabilities", 250)
+    }
+    private val subscriptionsChangedListener = object : SubscriptionManager.OnSubscriptionsChangedListener() {
+        override fun onSubscriptionsChanged() {
+            requestRealtimeCheck("active_subscriptions", 200)
+        }
     }
     private val defaultSubscriptionReceiver = object : BroadcastReceiver() {
         override fun onReceive(context: Context, intent: Intent?) {
@@ -64,13 +82,27 @@ class MonitorService : Service() {
                 "既定SIM変更通知を受信",
                 mapOf("action" to intent?.action),
             )
-            scheduleNext(150)
+            requestRealtimeCheck("default_subscription", 150)
+        }
+    }
+    private val unlockReceiver = object : BroadcastReceiver() {
+        override fun onReceive(context: Context, intent: Intent?) {
+            val action = intent?.action ?: return
+            val unlocked = getSystemService(UserManager::class.java).isUserUnlocked
+            val forceCheck = unlocked && prefs.claimUnlockCheck()
+            DiagnosticLog.info(
+                this@MonitorService,
+                "unlock_event",
+                "ロック解除イベントを受信",
+                mapOf("action" to action, "userUnlocked" to unlocked, "forceCheck" to forceCheck),
+            )
+            if (forceCheck) scheduleNext(0, forceDeepProbe = true)
         }
     }
     private val shizukuReceivedListener = Shizuku.OnBinderReceivedListener {
         backendInfo = null
         DiagnosticLog.info(this, "shizuku_available", "Shizukuが利用可能になりました")
-        scheduleNext(0)
+        scheduleNext(0, forceDeepProbe = true)
     }
     private val shizukuDeadListener = Shizuku.OnBinderDeadListener {
         backendInfo = null
@@ -88,7 +120,7 @@ class MonitorService : Service() {
                 "One UIの既定SIM設定変更を検出",
                 mapOf("source" to "settings_observer", "key" to uri?.lastPathSegment),
             )
-            scheduleNext(150)
+            requestRealtimeCheck("default_setting", 150)
         }
     }
 
@@ -97,13 +129,23 @@ class MonitorService : Service() {
         prefs = AppPreferences(this)
         switchAudit = SwitchAudit(this)
         connectivity = getSystemService(ConnectivityManager::class.java)
-        sims = SimRepository(this, mainExecutor)
+        subscriptionManager = getSystemService(SubscriptionManager::class.java)
+        sims = SimRepository(this, mainExecutor) { event, subId ->
+            requestRealtimeCheck(event, 300, mapOf("subId" to subId))
+        }
         runCatching { connectivity.registerDefaultNetworkCallback(networkCallback) }
             .onSuccess { networkCallbackRegistered = true }
             .onFailure { DiagnosticLog.warn(this, "network_callback_failed", "ネットワーク監視の登録に失敗", error = it) }
+        runCatching {
+            subscriptionManager.addOnSubscriptionsChangedListener(mainExecutor, subscriptionsChangedListener)
+            subscriptionListenerRegistered = true
+        }.onFailure {
+            DiagnosticLog.warn(this, "subscription_listener_failed", "SIM構成監視の登録に失敗", error = it)
+        }
         createNotificationChannel()
         startAsForeground("準備中")
-        registerReceiver(
+        ContextCompat.registerReceiver(
+            this,
             defaultSubscriptionReceiver,
             IntentFilter().apply {
                 addAction(SubscriptionManager.ACTION_DEFAULT_SUBSCRIPTION_CHANGED)
@@ -111,8 +153,18 @@ class MonitorService : Service() {
                 addAction(ACTION_DEFAULT_DATA_SUBSCRIPTION_CHANGED)
                 addAction(ACTION_DEFAULT_VOICE_SUBSCRIPTION_CHANGED)
             },
-            Context.RECEIVER_NOT_EXPORTED,
+            ContextCompat.RECEIVER_EXPORTED,
         )
+        ContextCompat.registerReceiver(
+            this,
+            unlockReceiver,
+            IntentFilter().apply {
+                addAction(Intent.ACTION_USER_UNLOCKED)
+                addAction(Intent.ACTION_USER_PRESENT)
+            },
+            ContextCompat.RECEIVER_EXPORTED,
+        )
+        unlockReceiverRegistered = true
         runCatching {
             DEFAULT_SETTING_KEYS.forEach { key ->
                 contentResolver.registerContentObserver(Settings.Global.getUriFor(key), false, defaultSettingsObserver)
@@ -153,7 +205,7 @@ class MonitorService : Service() {
                 stopSelf()
                 return START_NOT_STICKY
             }
-            ACTION_TEST_NOW -> enqueueCycle(forceDeepProbe = true)
+            ACTION_TEST_NOW -> scheduleNext(0, forceDeepProbe = true)
             else -> scheduleNext(0)
         }
         return START_STICKY
@@ -163,7 +215,11 @@ class MonitorService : Service() {
         stopped.set(true)
         mainHandler.removeCallbacksAndMessages(null)
         if (networkCallbackRegistered) runCatching { connectivity.unregisterNetworkCallback(networkCallback) }
+        if (subscriptionListenerRegistered) {
+            runCatching { subscriptionManager.removeOnSubscriptionsChangedListener(subscriptionsChangedListener) }
+        }
         if (settingsObserverRegistered) runCatching { contentResolver.unregisterContentObserver(defaultSettingsObserver) }
+        if (unlockReceiverRegistered) runCatching { unregisterReceiver(unlockReceiver) }
         runCatching { unregisterReceiver(defaultSubscriptionReceiver) }
         if (shizukuListenersRegistered) {
             runCatching { Shizuku.removeBinderReceivedListener(shizukuReceivedListener) }
@@ -178,22 +234,55 @@ class MonitorService : Service() {
 
     override fun onBind(intent: Intent?): IBinder? = null
 
-    private fun scheduleNext(delayMs: Long) {
-        mainHandler.removeCallbacksAndMessages(null)
-        mainHandler.postDelayed({
-            if (!stopped.get()) enqueueCycle(false)
-        }, delayMs)
+    private fun requestRealtimeCheck(
+        trigger: String,
+        delayMs: Long,
+        fields: Map<String, Any?> = emptyMap(),
+    ) {
+        DiagnosticLog.info(
+            this,
+            "realtime_trigger",
+            "リアルタイム再評価を予約",
+            mapOf("trigger" to trigger, "delayMs" to delayMs) + fields,
+        )
+        scheduleNext(delayMs)
+    }
+
+    private fun scheduleNext(delayMs: Long, forceDeepProbe: Boolean = false) {
+        if (forceDeepProbe) forceDeepProbeRequested.set(true)
+        val safeDelay = delayMs.coerceAtLeast(0L)
+        mainHandler.post {
+            if (stopped.get()) return@post
+            val candidate = SystemClock.elapsedRealtime() + safeDelay
+            if (!MonitorTiming.shouldReplace(scheduledAtElapsed, candidate)) return@post
+            mainHandler.removeCallbacks(scheduledCycle)
+            scheduledAtElapsed = candidate
+            mainHandler.postDelayed(scheduledCycle, safeDelay)
+        }
     }
 
     private fun enqueueCycle(forceDeepProbe: Boolean) {
         if (stopped.get() || worker.isShutdown) return
+        if (forceDeepProbe) forceDeepProbeRequested.set(true)
+        if (!cycleInFlight.compareAndSet(false, true)) {
+            rerunRequested.set(true)
+            return
+        }
         worker.execute {
-            runCatching { runCycle(forceDeepProbe) }
-                .onFailure {
-                    DiagnosticLog.error(this, "cycle_failed", "監視周期で予期しないエラー", error = it)
-                    val config = prefs.load()
-                    finishCycle("監視エラー · 次回再試行", config)
+            try {
+                val force = forceDeepProbeRequested.getAndSet(false)
+                runCatching { runCycle(force) }
+                    .onFailure {
+                        DiagnosticLog.error(this, "cycle_failed", "監視周期で予期しないエラー", error = it)
+                        val config = prefs.load()
+                        finishCycle("監視エラー · 次回再試行", config)
+                    }
+            } finally {
+                cycleInFlight.set(false)
+                if ((rerunRequested.getAndSet(false) || forceDeepProbeRequested.get()) && !stopped.get()) {
+                    scheduleNext(0)
                 }
+            }
         }
     }
 
@@ -463,6 +552,12 @@ class MonitorService : Service() {
     }
 
     private fun finishCycle(message: String, config: MonitorConfig) {
+        val nextCheckMs = MonitorTiming.nextDelayMs(
+            configuredIntervalMs = config.intervalSeconds * 1_000L,
+            enabled = config.enabled,
+            badSamples = badSamples,
+            requiredBadSamples = config.consecutiveFailures,
+        )
         DiagnosticLog.info(
             this,
             "decision",
@@ -484,6 +579,7 @@ class MonitorService : Service() {
                 "requiredBadSamples" to config.consecutiveFailures,
                 "cooldownMinutes" to config.cooldownMinutes,
                 "badSamples" to badSamples,
+                "nextCheckMs" to nextCheckMs,
                 "dataSubId" to SubscriptionManager.getDefaultDataSubscriptionId(),
                 "voiceSubId" to SubscriptionManager.getDefaultVoiceSubscriptionId(),
                 "smsSubId" to SubscriptionManager.getDefaultSmsSubscriptionId(),
@@ -501,7 +597,7 @@ class MonitorService : Service() {
             )
         }
         updateNotification(message)
-        if (config.needsService() && !stopped.get()) scheduleNext(config.intervalSeconds * 1_000L)
+        if (config.needsService() && !stopped.get()) scheduleNext(nextCheckMs)
     }
 
     private fun setDefaultWithAudit(
