@@ -13,12 +13,14 @@ import android.content.pm.ServiceInfo
 import android.net.ConnectivityManager
 import android.net.Network
 import android.net.NetworkCapabilities
+import android.net.TelephonyNetworkSpecifier
 import android.os.Build
 import android.os.Handler
 import android.os.IBinder
 import android.os.Looper
 import android.telecom.TelecomManager
 import android.telephony.SubscriptionManager
+import android.util.Log
 import androidx.annotation.RequiresPermission
 import androidx.core.app.NotificationCompat
 import androidx.core.content.ContextCompat
@@ -100,6 +102,11 @@ class MonitorService : Service() {
         }
         val active = connectivity.activeNetwork
         val activeCaps = active?.let(connectivity::getNetworkCapabilities)
+        Log.i(
+            TAG,
+            "cycle force=$forceDeepProbe active=$active wifi=${activeCaps?.hasTransport(NetworkCapabilities.TRANSPORT_WIFI)} " +
+                "cellular=${activeCaps?.hasTransport(NetworkCapabilities.TRANSPORT_CELLULAR)} lines=${lines.map { it.subId }}",
+        )
         if (activeCaps?.hasTransport(NetworkCapabilities.TRANSPORT_WIFI) == true) {
             badSamples = 0
             if (!config.wifiRestoreEnabled) {
@@ -149,13 +156,14 @@ class MonitorService : Service() {
             return
         }
 
-        val cellularNetwork = findCellularNetwork()
+        val cellularNetwork = findCellularNetwork(dataSubId)
         val caps = cellularNetwork?.let(connectivity::getNetworkCapabilities)
         val validated = caps?.hasCapability(NetworkCapabilities.NET_CAPABILITY_VALIDATED) == true
         val latency = cellularNetwork?.let(::latencyProbe)
         sampleCount++
         val shouldMeasureSpeed = forceDeepProbe || latency == null || latency > config.latencyThresholdMs || sampleCount % 10 == 0
         val speed = if (shouldMeasureSpeed) cellularNetwork?.let(::speedProbe) else null
+        Log.i(TAG, "probe subId=$dataSubId network=$cellularNetwork validated=$validated latencyMs=$latency speedKbps=$speed")
         val sample = QualitySample(current.inService, current.signalLevel, validated, latency, speed)
         val bad = AutoSwitchDecider.isBad(sample, config)
         badSamples = if (bad) badSamples + 1 else 0
@@ -248,16 +256,39 @@ class MonitorService : Service() {
     private fun isInCall(): Boolean =
         runCatching { getSystemService(TelecomManager::class.java).isInCall }.getOrDefault(false)
 
-    private fun findCellularNetwork(): Network? {
-        return connectivity.allNetworks.firstOrNull { network ->
-            val caps = connectivity.getNetworkCapabilities(network) ?: return@firstOrNull false
-            caps.hasTransport(NetworkCapabilities.TRANSPORT_CELLULAR)
-        }
+    private fun findCellularNetwork(subId: Int): Network? {
+        return connectivity.allNetworks
+            .mapNotNull { network ->
+                val caps = connectivity.getNetworkCapabilities(network) ?: return@mapNotNull null
+                if (!caps.hasTransport(NetworkCapabilities.TRANSPORT_CELLULAR) ||
+                    !caps.hasCapability(NetworkCapabilities.NET_CAPABILITY_INTERNET) ||
+                    !caps.hasCapability(NetworkCapabilities.NET_CAPABILITY_NOT_RESTRICTED) ||
+                    !caps.hasCapability(NetworkCapabilities.NET_CAPABILITY_NOT_VPN)
+                ) return@mapNotNull null
+
+                val networkSubId = (caps.networkSpecifier as? TelephonyNetworkSpecifier)?.subscriptionId
+                if (networkSubId != null && networkSubId != subId) return@mapNotNull null
+                network to caps
+            }
+            .maxByOrNull { (_, caps) ->
+                if (caps.hasCapability(NetworkCapabilities.NET_CAPABILITY_VALIDATED)) 1 else 0
+            }
+            ?.first
     }
 
-    private fun latencyProbe(network: Network): Long? = runCatching {
+    private fun latencyProbe(network: Network): Long? {
+        val url = URL(LATENCY_URL)
+        val bound = latencyAttempt { network.openConnection(url) as HttpURLConnection }
+        if (bound.isSuccess) return bound.getOrNull()
+        Log.i(TAG, "direct probe unavailable on $network; using the app default route")
+        return latencyAttempt { url.openConnection() as HttpURLConnection }
+            .onFailure { Log.w(TAG, "default-route latency probe failed: ${it.message}", it) }
+            .getOrNull()
+    }
+
+    private fun latencyAttempt(open: () -> HttpURLConnection): Result<Long> = runCatching {
         val started = System.nanoTime()
-        val connection = network.openConnection(URL(LATENCY_URL)) as HttpURLConnection
+        val connection = open()
         try {
             connection.instanceFollowRedirects = false
             connection.connectTimeout = 5_000
@@ -269,11 +300,21 @@ class MonitorService : Service() {
         } finally {
             connection.disconnect()
         }
-    }.getOrNull()
+    }
 
-    private fun speedProbe(network: Network): Long? = runCatching {
+    private fun speedProbe(network: Network): Long? {
+        val url = URL(SPEED_URL)
+        val bound = speedAttempt { network.openConnection(url) as HttpURLConnection }
+        if (bound.isSuccess) return bound.getOrNull()
+        Log.i(TAG, "direct speed probe unavailable on $network; using the app default route")
+        return speedAttempt { url.openConnection() as HttpURLConnection }
+            .onFailure { Log.w(TAG, "default-route speed probe failed: ${it.message}", it) }
+            .getOrNull()
+    }
+
+    private fun speedAttempt(open: () -> HttpURLConnection): Result<Long> = runCatching {
         val started = System.nanoTime()
-        val connection = network.openConnection(URL(SPEED_URL)) as HttpURLConnection
+        val connection = open()
         try {
             connection.connectTimeout = 7_000
             connection.readTimeout = 7_000
@@ -292,7 +333,7 @@ class MonitorService : Service() {
         } finally {
             connection.disconnect()
         }
-    }.getOrNull()
+    }
 
     private fun createNotificationChannel() {
         val channel = NotificationChannel(
@@ -340,6 +381,7 @@ class MonitorService : Service() {
 
     companion object {
         private const val CHANNEL_ID = "sim_pilot_monitor"
+        private const val TAG = "SimPilotMonitor"
         private const val NOTIFICATION_ID = 6201
         private const val LATENCY_URL = "https://connectivitycheck.gstatic.com/generate_204"
         private const val SPEED_URL = "https://speed.cloudflare.com/__down?bytes=65536"

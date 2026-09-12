@@ -12,6 +12,7 @@ Galaxy S26 Ultra（SM-S948Q / One UI 8.5）の DSDV 環境向けに、端末で�
 - 挿入中のSIMと回線名を自動検出し、存在しない復帰先だけを安全に保留
 - 通話中の切替禁止、連続判定、切替後クールダウンで誤動作を抑制
 - 応答時間、電波状態、ネットワーク検証、64KB実効速度テストを組み合わせた判定
+- VPNやIMS・MMSなどの専用ネットワークを除外し、既定SIMの物理的な通常インターネット経路だけを測定
 - Foreground Service、再起動後の監視復帰、Android 17のPromoted Ongoing通知
 - Material Design 3、動的カラー、edge-to-edge、画面幅に応じた適応レイアウト
 
