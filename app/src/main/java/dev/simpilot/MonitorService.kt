@@ -1,6 +1,7 @@
 package dev.simpilot
 
 import android.Manifest
+import android.annotation.SuppressLint
 import android.app.Notification
 import android.app.NotificationChannel
 import android.app.NotificationManager
@@ -35,13 +36,20 @@ class MonitorService : Service() {
     private lateinit var connectivity: ConnectivityManager
     private var badSamples = 0
     private var sampleCount = 0
+    private var lastWifiPolicySignature: String? = null
     private val stopped = AtomicBoolean(false)
+    private val networkCallback = object : ConnectivityManager.NetworkCallback() {
+        override fun onAvailable(network: Network) = scheduleNext(250)
+        override fun onLost(network: Network) = scheduleNext(250)
+        override fun onCapabilitiesChanged(network: Network, networkCapabilities: NetworkCapabilities) = scheduleNext(250)
+    }
 
     override fun onCreate() {
         super.onCreate()
         prefs = AppPreferences(this)
         connectivity = getSystemService(ConnectivityManager::class.java)
         sims = SimRepository(this, mainExecutor)
+        connectivity.registerDefaultNetworkCallback(networkCallback)
         createNotificationChannel()
         startAsForeground("準備中")
         AppState.update { it.copy(monitorRunning = true, status = "モニターを準備中") }
@@ -50,7 +58,7 @@ class MonitorService : Service() {
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
         when (intent?.action) {
             ACTION_STOP -> {
-                prefs.save(prefs.load().copy(enabled = false))
+                prefs.save(prefs.load().copy(enabled = false, wifiRestoreEnabled = false))
                 stopSelf()
                 return START_NOT_STICKY
             }
@@ -63,6 +71,7 @@ class MonitorService : Service() {
     override fun onDestroy() {
         stopped.set(true)
         mainHandler.removeCallbacksAndMessages(null)
+        runCatching { connectivity.unregisterNetworkCallback(networkCallback) }
         sims.unregister()
         worker.shutdownNow()
         AppState.update { it.copy(monitorRunning = false, status = "停止中") }
@@ -80,7 +89,7 @@ class MonitorService : Service() {
 
     private fun runCycle(forceDeepProbe: Boolean) {
         val config = prefs.load()
-        if (!config.enabled && !forceDeepProbe) {
+        if (!config.needsService() && !forceDeepProbe) {
             stopSelf()
             return
         }
@@ -89,20 +98,46 @@ class MonitorService : Service() {
             finishCycle("電話の権限を許可してください", config)
             return
         }
+        val active = connectivity.activeNetwork
+        val activeCaps = active?.let(connectivity::getNetworkCapabilities)
+        if (activeCaps?.hasTransport(NetworkCapabilities.TRANSPORT_WIFI) == true) {
+            badSamples = 0
+            if (!config.wifiRestoreEnabled) {
+                lastWifiPolicySignature = config.wifiPolicySignature()
+                finishCycle("Wi-Fi接続中 · モバイル切替停止", config)
+                return
+            }
+            if (!ShizukuBridge.isGranted()) {
+                finishCycle("Wi-Fi復帰にはShizuku権限が必要です", config)
+                return
+            }
+            val inCall = isInCall()
+            if (inCall) {
+                finishCycle("Wi-Fi接続中 · 通話終了後に既定SIMへ復帰", config)
+                return
+            }
+            val signature = config.wifiPolicySignature() + ":" + lines.joinToString(",") { it.subId.toString() }
+            val message = if (lastWifiPolicySignature != signature) {
+                applyWifiPolicy(config, lines).also { lastWifiPolicySignature = signature }
+            } else {
+                "Wi-Fi接続中 · 既定SIM復帰済み"
+            }
+            finishCycle(message, config)
+            return
+        }
+        lastWifiPolicySignature = null
+
+        if (!config.enabled) {
+            finishCycle("モバイル自動切替は停止中", config)
+            return
+        }
+
         if (!ShizukuBridge.isGranted()) {
             finishCycle("Shizuku権限を許可してください", config)
             return
         }
         if (lines.size < 2) {
-            finishCycle("有効なSIMを2回線確認できません", config)
-            return
-        }
-
-        val active = connectivity.activeNetwork
-        val activeCaps = active?.let(connectivity::getNetworkCapabilities)
-        if (activeCaps?.hasTransport(NetworkCapabilities.TRANSPORT_WIFI) == true) {
-            badSamples = 0
-            finishCycle("Wi-Fi接続中 · 切替停止", config)
+            finishCycle("有効なSIMは${lines.size}回線 · 自動切替を待機", config)
             return
         }
 
@@ -114,7 +149,7 @@ class MonitorService : Service() {
             return
         }
 
-        val cellularNetwork = findCellularNetwork(dataSubId)
+        val cellularNetwork = findCellularNetwork()
         val caps = cellularNetwork?.let(connectivity::getNetworkCapabilities)
         val validated = caps?.hasCapability(NetworkCapabilities.NET_CAPABILITY_VALIDATED) == true
         val latency = cellularNetwork?.let(::latencyProbe)
@@ -131,7 +166,7 @@ class MonitorService : Service() {
 
         val cooldownMs = config.cooldownMinutes * 60_000L
         val inCooldown = System.currentTimeMillis() - prefs.lastSwitchAt < cooldownMs
-        val inCall = runCatching { getSystemService(TelecomManager::class.java).isInCall }.getOrDefault(false)
+        val inCall = isInCall()
         if (badSamples >= config.consecutiveFailures && alternate != null && !inCooldown && !inCall) {
             switchDataAndFollowers(alternate.subId, config)
             badSamples = 0
@@ -160,10 +195,45 @@ class MonitorService : Service() {
         AppState.update { it.copy(lastSwitchAt = prefs.lastSwitchAt) }
     }
 
+    private fun applyWifiPolicy(config: MonitorConfig, lines: List<SimLine>): String {
+        val requested = buildList {
+            if (config.wifiDataEnabled) add(SimRole.DATA to config.wifiDataSubId)
+            if (config.wifiVoiceEnabled) add(SimRole.VOICE to config.wifiVoiceSubId)
+            if (config.wifiSmsEnabled) add(SimRole.SMS to config.wifiSmsSubId)
+        }
+        if (requested.isEmpty()) return "Wi-Fi接続中 · 復帰対象なし"
+
+        val changed = mutableListOf<String>()
+        val skipped = mutableListOf<String>()
+        requested.forEach { (role, subId) ->
+            val line = lines.firstOrNull { it.subId == subId }
+            if (line == null) {
+                skipped += if (subId < 0) "${role.label}SIM未設定" else "${role.label}SIM未検出"
+                return@forEach
+            }
+            val current = when (role) {
+                SimRole.DATA -> SubscriptionManager.getDefaultDataSubscriptionId()
+                SimRole.VOICE -> SubscriptionManager.getDefaultVoiceSubscriptionId()
+                SimRole.SMS -> SubscriptionManager.getDefaultSmsSubscriptionId()
+            }
+            if (current == subId) return@forEach
+            ShizukuBridge.setDefault(role, subId)
+                .onSuccess { changed += "${role.label}=${line.title}" }
+                .onFailure { skipped += "${role.label}失敗" }
+        }
+        sims.refresh()
+        return when {
+            changed.isNotEmpty() && skipped.isNotEmpty() -> "Wi-Fi復帰: ${changed.joinToString()} · ${skipped.joinToString()}"
+            changed.isNotEmpty() -> "Wi-Fi復帰: ${changed.joinToString()}"
+            skipped.isNotEmpty() -> "Wi-Fi復帰保留: ${skipped.joinToString()}"
+            else -> "Wi-Fi接続中 · 既定SIM復帰済み"
+        }
+    }
+
     private fun finishCycle(message: String, config: MonitorConfig) {
         AppState.update {
             it.copy(
-                monitorRunning = config.enabled,
+                monitorRunning = config.needsService(),
                 status = message,
                 shizukuReady = ShizukuBridge.isReady(),
                 shizukuGranted = ShizukuBridge.isGranted(),
@@ -171,14 +241,17 @@ class MonitorService : Service() {
             )
         }
         updateNotification(message)
-        if (config.enabled && !stopped.get()) scheduleNext(config.intervalSeconds * 1_000L)
+        if (config.needsService() && !stopped.get()) scheduleNext(config.intervalSeconds * 1_000L)
     }
 
-    private fun findCellularNetwork(subId: Int): Network? {
+    @SuppressLint("MissingPermission")
+    private fun isInCall(): Boolean =
+        runCatching { getSystemService(TelecomManager::class.java).isInCall }.getOrDefault(false)
+
+    private fun findCellularNetwork(): Network? {
         return connectivity.allNetworks.firstOrNull { network ->
             val caps = connectivity.getNetworkCapabilities(network) ?: return@firstOrNull false
-            caps.hasTransport(NetworkCapabilities.TRANSPORT_CELLULAR) &&
-                (Build.VERSION.SDK_INT < 29 || caps.subscriptionIds.isEmpty() || subId in caps.subscriptionIds)
+            caps.hasTransport(NetworkCapabilities.TRANSPORT_CELLULAR)
         }
     }
 

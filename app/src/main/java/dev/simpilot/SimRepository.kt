@@ -1,6 +1,7 @@
 package dev.simpilot
 
 import android.Manifest
+import android.annotation.SuppressLint
 import android.content.Context
 import android.content.pm.PackageManager
 import android.os.Build
@@ -60,6 +61,7 @@ class SimRepository(private val context: Context, private val executor: Executor
     fun hasPhonePermission(): Boolean =
         ContextCompat.checkSelfPermission(context, Manifest.permission.READ_PHONE_STATE) == PackageManager.PERMISSION_GRANTED
 
+    @SuppressLint("MissingPermission")
     fun refresh(): List<SimLine> {
         if (!hasPhonePermission()) {
             AppState.update { it.copy(lines = emptyList(), status = "電話の権限が必要です") }

@@ -1,13 +1,15 @@
 # SIM Pilot
 
-Galaxy S26 Ultra（SM-S948Q / One UI 8.5）の DSDV 環境向けに、povo と LINEMO の既定SIMを管理するAndroidアプリです。
+Galaxy S26 Ultra（SM-S948Q / One UI 8.5）の DSDV 環境向けに、端末で検出した回線の既定SIMを管理するAndroidアプリです。
 
 ## 主な機能
 
 - データ、通話、メッセージの既定SIMを完全に独立して変更
 - 通信品質の連続悪化を検知してデータSIMを自動切替
 - 通話・メッセージをデータSIMへ追従させるか個別に設定
-- Wi-Fi接続中は判定・切替を必ず停止
+- Wi-Fi接続中は自動フェイルオーバーを停止
+- Wi-Fi接続時にデータ・通話・メッセージを戻すか、どのSIMへ戻すかを個別に設定
+- 挿入中のSIMと回線名を自動検出し、存在しない復帰先だけを安全に保留
 - 通話中の切替禁止、連続判定、切替後クールダウンで誤動作を抑制
 - 応答時間、電波状態、ネットワーク検証、64KB実効速度テストを組み合わせた判定
 - Foreground Service、再起動後の監視復帰、Android 17のPromoted Ongoing通知
@@ -15,9 +17,9 @@ Galaxy S26 Ultra（SM-S948Q / One UI 8.5）の DSDV 環境向けに、povo と L
 
 ## 対応環境
 
-- `compileSdk 37` / `targetSdk 37` / `minSdk 24`
+- `compileSdk 37` / `targetSdk 37` / `minSdk 31`
 - Galaxy S26 Ultra SM-S948Q、Android 16、One UI 8.5で実機検証
-- Shizuku または互換実装が必要（ADB権限で起動）
+- Shizuku または Shizuku Plus が必要（ADB権限で起動）
 
 SIM切替はSamsung One UI 8.5で確認した `ISub` transactionをShizuku UserService（UID 2000）から呼びます。端末や大型アップデートで内部APIが変わる可能性があるため、現時点では上記実機を対象とします。
 
@@ -31,11 +33,13 @@ APKは `app/build/outputs/apk/debug/app-debug.apk` に生成されます。
 
 ## 初期設定
 
-1. ShizukuをワイヤレスデバッグまたはADBで起動します。
+1. ShizukuまたはShizuku Plusをワイヤレスデバッグ／ADBで起動します。
 2. SIM Pilotを開き、電話・位置情報・通知を許可します。
 3. Shizukuのアクセス許可を与えます。
 4. 「データSIMを自動切替」をONにします。
 5. 安定運用のため、端末設定でSIM Pilotをバッテリー最適化の対象外にします。
+
+設定画面の「Wi-Fi接続時」では、復帰機能全体とデータ・通話・メッセージの各対象を独立してON/OFFできます。「現在の既定SIMを復帰先にセット」を使うと、現在の3つの割り当てをまとめて記録できます。SIM名やSIMの有無は `SubscriptionManager` から毎回取得し、通信会社名をコードへ固定していません。
 
 ## 判定と通信量
 

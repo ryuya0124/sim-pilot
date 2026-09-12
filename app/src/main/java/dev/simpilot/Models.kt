@@ -24,12 +24,28 @@ data class MonitorConfig(
     val enabled: Boolean = false,
     val followVoice: Boolean = false,
     val followSms: Boolean = false,
+    val wifiRestoreEnabled: Boolean = false,
+    val wifiDataEnabled: Boolean = true,
+    val wifiDataSubId: Int = -1,
+    val wifiVoiceEnabled: Boolean = false,
+    val wifiVoiceSubId: Int = -1,
+    val wifiSmsEnabled: Boolean = false,
+    val wifiSmsSubId: Int = -1,
     val intervalSeconds: Int = 30,
     val latencyThresholdMs: Int = 1200,
     val speedThresholdKbps: Int = 512,
     val consecutiveFailures: Int = 3,
     val cooldownMinutes: Int = 5,
-)
+) {
+    fun needsService(): Boolean = enabled || wifiRestoreEnabled
+
+    fun wifiPolicySignature(): String = listOf(
+        wifiRestoreEnabled,
+        wifiDataEnabled, wifiDataSubId,
+        wifiVoiceEnabled, wifiVoiceSubId,
+        wifiSmsEnabled, wifiSmsSubId,
+    ).joinToString(":")
+}
 
 data class AppSnapshot(
     val lines: List<SimLine> = emptyList(),

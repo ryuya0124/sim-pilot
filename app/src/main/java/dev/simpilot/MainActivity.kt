@@ -60,7 +60,6 @@ import androidx.compose.material3.Icon
 import androidx.compose.material3.IconButton
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.ModalBottomSheet
-import androidx.compose.material3.Scaffold
 import androidx.compose.material3.Slider
 import androidx.compose.material3.Surface
 import androidx.compose.material3.Switch
@@ -167,10 +166,11 @@ private fun SimPilotApp(repository: SimRepository) {
     }
 
     LaunchedEffect(Unit) {
-        if (config.enabled) MonitorService.start(context)
+        if (config.needsService()) MonitorService.start(context)
         val missing = buildList {
             if (ContextCompat.checkSelfPermission(context, Manifest.permission.READ_PHONE_STATE) != PackageManager.PERMISSION_GRANTED) {
                 add(Manifest.permission.READ_PHONE_STATE)
+                add(Manifest.permission.ACCESS_COARSE_LOCATION)
                 add(Manifest.permission.ACCESS_FINE_LOCATION)
             }
             if (Build.VERSION.SDK_INT >= 33 && ContextCompat.checkSelfPermission(context, Manifest.permission.POST_NOTIFICATIONS) != PackageManager.PERMISSION_GRANTED) {
@@ -183,7 +183,7 @@ private fun SimPilotApp(repository: SimRepository) {
     fun persist(next: MonitorConfig) {
         config = next
         AppPreferences(context).save(next)
-        if (next.enabled) MonitorService.start(context) else MonitorService.stop(context)
+        if (next.needsService()) MonitorService.start(context) else MonitorService.stop(context)
     }
 
     fun switch(role: SimRole, subId: Int) {
@@ -205,20 +205,19 @@ private fun SimPilotApp(repository: SimRepository) {
         }
     }
 
-    Scaffold(containerColor = Color.Transparent) { scaffoldPadding ->
-        Box(
-            Modifier
-                .fillMaxSize()
-                .background(
-                    Brush.verticalGradient(
-                        listOf(
-                            MaterialTheme.colorScheme.surface,
-                            MaterialTheme.colorScheme.surfaceContainerLowest,
-                            MaterialTheme.colorScheme.surfaceContainer,
-                        )
+    Box(
+        Modifier
+            .fillMaxSize()
+            .background(
+                Brush.verticalGradient(
+                    listOf(
+                        MaterialTheme.colorScheme.surface,
+                        MaterialTheme.colorScheme.surfaceContainerLowest,
+                        MaterialTheme.colorScheme.surfaceContainer,
                     )
                 )
-        ) {
+            )
+    ) {
             LazyColumn(
                 modifier = Modifier.fillMaxSize(),
                 contentPadding = PaddingValues(
@@ -294,11 +293,18 @@ private fun SimPilotApp(repository: SimRepository) {
                     }
                 }
             }
-        }
     }
 
     if (showSettings) {
-        SettingsSheet(config, onDismiss = { showSettings = false }, onChange = ::persist)
+        SettingsSheet(
+            config = config,
+            lines = snapshot.lines,
+            dataSubId = snapshot.dataSubId,
+            voiceSubId = snapshot.voiceSubId,
+            smsSubId = snapshot.smsSubId,
+            onDismiss = { showSettings = false },
+            onChange = ::persist,
+        )
     }
 }
 
@@ -359,7 +365,7 @@ private fun ShizukuCard(ready: Boolean, onRequest: () -> Unit) {
             Column(Modifier.weight(1f)) {
                 Text(if (ready) "Shizukuの許可が必要" else "Shizukuを起動してください", fontWeight = FontWeight.Bold)
                 Text(
-                    if (ready) "SIM切替にだけshell権限を使用します" else "ワイヤレスデバッグでShizukuを開始します",
+                    if (ready) "通常版／Shizuku Plusのshell権限を使用します" else "ShizukuまたはShizuku Plusを起動します",
                     style = MaterialTheme.typography.bodySmall,
                 )
             }
@@ -381,7 +387,7 @@ private fun AutoCard(config: MonitorConfig, running: Boolean, onChange: (Monitor
                 Spacer(Modifier.width(10.dp))
                 Column(Modifier.weight(1f)) {
                     Text("データSIMを自動切替", fontWeight = FontWeight.Bold, style = MaterialTheme.typography.titleMedium)
-                    Text(if (running) "バックグラウンドで監視中" else "通信品質の低下を検知して切替", style = MaterialTheme.typography.bodySmall)
+                    Text(if (config.enabled && running) "バックグラウンドで監視中" else "通信品質の低下を検知して切替", style = MaterialTheme.typography.bodySmall)
                 }
                 Switch(checked = config.enabled, onCheckedChange = { onChange(config.copy(enabled = it)) })
             }
@@ -447,6 +453,9 @@ private fun RoleCard(
                     )
                 }
             }
+            if (lines.isEmpty()) {
+                Text("有効なSIMがありません", style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.onSurfaceVariant)
+            }
         }
     }
 }
@@ -483,6 +492,15 @@ private fun Metric(label: String, value: String, modifier: Modifier) {
 private fun SimDetails(lines: List<SimLine>, dataSubId: Int) {
     Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
         Text("回線状態", style = MaterialTheme.typography.titleLarge, fontWeight = FontWeight.Bold)
+        if (lines.isEmpty()) {
+            Card(shape = RoundedCornerShape(18.dp), colors = CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.surfaceContainerLowest)) {
+                Text(
+                    "有効なSIMは検出されていません",
+                    modifier = Modifier.fillMaxWidth().padding(18.dp),
+                    color = MaterialTheme.colorScheme.onSurfaceVariant,
+                )
+            }
+        }
         lines.forEach { line ->
             Card(shape = RoundedCornerShape(18.dp), colors = CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.surfaceContainerLowest)) {
                 Row(Modifier.padding(15.dp), verticalAlignment = Alignment.CenterVertically) {
@@ -508,35 +526,162 @@ private fun signalText(level: Int) = if (level < 0) "取得中" else "電波 $le
 
 @OptIn(ExperimentalMaterial3Api::class)
 @Composable
-private fun SettingsSheet(config: MonitorConfig, onDismiss: () -> Unit, onChange: (MonitorConfig) -> Unit) {
+private fun SettingsSheet(
+    config: MonitorConfig,
+    lines: List<SimLine>,
+    dataSubId: Int,
+    voiceSubId: Int,
+    smsSubId: Int,
+    onDismiss: () -> Unit,
+    onChange: (MonitorConfig) -> Unit,
+) {
     ModalBottomSheet(onDismissRequest = onDismiss) {
-        Column(
-            Modifier.padding(start = 22.dp, end = 22.dp, bottom = 32.dp),
+        LazyColumn(
+            contentPadding = PaddingValues(start = 22.dp, end = 22.dp, bottom = 32.dp),
             verticalArrangement = Arrangement.spacedBy(18.dp),
         ) {
-            Text("自動切替の判定", style = MaterialTheme.typography.headlineSmall, fontWeight = FontWeight.Bold)
-            SettingSlider("監視間隔", "${config.intervalSeconds} 秒", config.intervalSeconds.toFloat(), 15f..120f, 7) {
-                onChange(config.copy(intervalSeconds = it.toInt()))
+            item {
+                Text("Wi-Fi接続時", style = MaterialTheme.typography.headlineSmall, fontWeight = FontWeight.Bold)
             }
-            SettingSlider("遅延しきい値", "${config.latencyThresholdMs} ms", config.latencyThresholdMs.toFloat(), 300f..3000f, 8) {
-                onChange(config.copy(latencyThresholdMs = (it / 100).toInt() * 100))
+            item {
+                Surface(shape = RoundedCornerShape(22.dp), color = MaterialTheme.colorScheme.surfaceContainerHigh) {
+                    Column(Modifier.padding(16.dp), verticalArrangement = Arrangement.spacedBy(14.dp)) {
+                        Row(verticalAlignment = Alignment.CenterVertically) {
+                            Icon(Icons.Rounded.Wifi, null)
+                            Spacer(Modifier.width(10.dp))
+                            Column(Modifier.weight(1f)) {
+                                Text("指定した既定SIMへ戻す", fontWeight = FontWeight.Bold)
+                                Text("モバイル通信の自動切替は常に停止します", style = MaterialTheme.typography.bodySmall)
+                            }
+                            Switch(
+                                checked = config.wifiRestoreEnabled,
+                                onCheckedChange = { onChange(config.copy(wifiRestoreEnabled = it)) },
+                            )
+                        }
+                        AnimatedVisibility(config.wifiRestoreEnabled) {
+                            Column(verticalArrangement = Arrangement.spacedBy(14.dp)) {
+                                FilledTonalButton(
+                                    onClick = {
+                                        onChange(
+                                            config.copy(
+                                                wifiDataSubId = dataSubId,
+                                                wifiVoiceSubId = voiceSubId,
+                                                wifiSmsSubId = smsSubId,
+                                            )
+                                        )
+                                    },
+                                    enabled = lines.isNotEmpty(),
+                                    modifier = Modifier.fillMaxWidth(),
+                                ) {
+                                    Text("現在の既定SIMを復帰先にセット")
+                                }
+                                WifiRoleSetting(
+                                    role = SimRole.DATA,
+                                    enabled = config.wifiDataEnabled,
+                                    selectedSubId = config.wifiDataSubId,
+                                    lines = lines,
+                                    onEnabled = { onChange(config.copy(wifiDataEnabled = it)) },
+                                    onSelected = { onChange(config.copy(wifiDataSubId = it)) },
+                                )
+                                WifiRoleSetting(
+                                    role = SimRole.VOICE,
+                                    enabled = config.wifiVoiceEnabled,
+                                    selectedSubId = config.wifiVoiceSubId,
+                                    lines = lines,
+                                    onEnabled = { onChange(config.copy(wifiVoiceEnabled = it)) },
+                                    onSelected = { onChange(config.copy(wifiVoiceSubId = it)) },
+                                )
+                                WifiRoleSetting(
+                                    role = SimRole.SMS,
+                                    enabled = config.wifiSmsEnabled,
+                                    selectedSubId = config.wifiSmsSubId,
+                                    lines = lines,
+                                    onEnabled = { onChange(config.copy(wifiSmsEnabled = it)) },
+                                    onSelected = { onChange(config.copy(wifiSmsSubId = it)) },
+                                )
+                            }
+                        }
+                    }
+                }
             }
-            SettingSlider("最低速度", "${config.speedThresholdKbps} kbps", config.speedThresholdKbps.toFloat(), 128f..2048f, 7) {
-                onChange(config.copy(speedThresholdKbps = (it / 128).toInt() * 128))
+            item {
+                Text("自動切替の判定", style = MaterialTheme.typography.headlineSmall, fontWeight = FontWeight.Bold)
             }
-            SettingSlider("連続低品質", "${config.consecutiveFailures} 回", config.consecutiveFailures.toFloat(), 2f..5f, 2) {
-                onChange(config.copy(consecutiveFailures = it.toInt()))
+            item {
+                SettingSlider("監視間隔", "${config.intervalSeconds} 秒", config.intervalSeconds.toFloat(), 15f..120f, 7) {
+                    onChange(config.copy(intervalSeconds = it.toInt()))
+                }
             }
-            SettingSlider("切替後クールダウン", "${config.cooldownMinutes} 分", config.cooldownMinutes.toFloat(), 1f..30f, 28) {
-                onChange(config.copy(cooldownMinutes = it.toInt()))
+            item {
+                SettingSlider("遅延しきい値", "${config.latencyThresholdMs} ms", config.latencyThresholdMs.toFloat(), 300f..3000f, 8) {
+                    onChange(config.copy(latencyThresholdMs = (it / 100).toInt() * 100))
+                }
             }
-            Surface(shape = RoundedCornerShape(16.dp), color = MaterialTheme.colorScheme.surfaceContainerHigh) {
-                Text(
-                    "Wi-Fi接続中は必ず切替を停止します。通常は小さな疎通確認のみ。約5分ごと、または遅延悪化時に64KBの速度テストを行います。通話中とクールダウン中にも切り替えません。",
-                    modifier = Modifier.padding(14.dp),
-                    style = MaterialTheme.typography.bodySmall,
-                    color = MaterialTheme.colorScheme.onSurfaceVariant,
-                )
+            item {
+                SettingSlider("最低速度", "${config.speedThresholdKbps} kbps", config.speedThresholdKbps.toFloat(), 128f..2048f, 7) {
+                    onChange(config.copy(speedThresholdKbps = (it / 128).toInt() * 128))
+                }
+            }
+            item {
+                SettingSlider("連続低品質", "${config.consecutiveFailures} 回", config.consecutiveFailures.toFloat(), 2f..5f, 2) {
+                    onChange(config.copy(consecutiveFailures = it.toInt()))
+                }
+            }
+            item {
+                SettingSlider("切替後クールダウン", "${config.cooldownMinutes} 分", config.cooldownMinutes.toFloat(), 1f..30f, 28) {
+                    onChange(config.copy(cooldownMinutes = it.toInt()))
+                }
+            }
+            item {
+                Surface(shape = RoundedCornerShape(16.dp), color = MaterialTheme.colorScheme.surfaceContainerHigh) {
+                    Text(
+                        "SIMの有無と表示名は端末から自動取得します。Wi-Fi復帰先が抜かれている場合、その項目だけ安全に保留します。通常は小さな疎通確認のみで、約5分ごと、または遅延悪化時に64KBの速度テストを行います。",
+                        modifier = Modifier.padding(14.dp),
+                        style = MaterialTheme.typography.bodySmall,
+                        color = MaterialTheme.colorScheme.onSurfaceVariant,
+                    )
+                }
+            }
+        }
+    }
+}
+
+@Composable
+private fun WifiRoleSetting(
+    role: SimRole,
+    enabled: Boolean,
+    selectedSubId: Int,
+    lines: List<SimLine>,
+    onEnabled: (Boolean) -> Unit,
+    onSelected: (Int) -> Unit,
+) {
+    Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
+        Row(verticalAlignment = Alignment.CenterVertically) {
+            Text("${role.label}を戻す", Modifier.weight(1f), fontWeight = FontWeight.Medium)
+            Switch(enabled, onEnabled)
+        }
+        AnimatedVisibility(enabled) {
+            Column(verticalArrangement = Arrangement.spacedBy(6.dp)) {
+                if (lines.isEmpty()) {
+                    Text("有効なSIMがありません", style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.error)
+                } else {
+                    FlowRow(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                        lines.forEach { line ->
+                            FilterChip(
+                                selected = selectedSubId == line.subId,
+                                onClick = { onSelected(line.subId) },
+                                label = { Text(line.title, maxLines = 1, overflow = TextOverflow.Ellipsis) },
+                            )
+                        }
+                    }
+                    if (selectedSubId !in lines.map { it.subId }) {
+                        Text(
+                            if (selectedSubId < 0) "復帰先を選択してください" else "設定したSIMは現在ありません",
+                            style = MaterialTheme.typography.bodySmall,
+                            color = MaterialTheme.colorScheme.error,
+                        )
+                    }
+                }
             }
         }
     }

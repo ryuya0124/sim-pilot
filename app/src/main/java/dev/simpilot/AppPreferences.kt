@@ -9,6 +9,13 @@ class AppPreferences(context: Context) {
         enabled = prefs.getBoolean("enabled", false),
         followVoice = prefs.getBoolean("follow_voice", false),
         followSms = prefs.getBoolean("follow_sms", false),
+        wifiRestoreEnabled = prefs.getBoolean("wifi_restore_enabled", false),
+        wifiDataEnabled = prefs.getBoolean("wifi_data_enabled", true),
+        wifiDataSubId = prefs.getInt("wifi_data_sub_id", -1),
+        wifiVoiceEnabled = prefs.getBoolean("wifi_voice_enabled", false),
+        wifiVoiceSubId = prefs.getInt("wifi_voice_sub_id", -1),
+        wifiSmsEnabled = prefs.getBoolean("wifi_sms_enabled", false),
+        wifiSmsSubId = prefs.getInt("wifi_sms_sub_id", -1),
         intervalSeconds = prefs.getInt("interval", 30),
         latencyThresholdMs = prefs.getInt("latency", 1200),
         speedThresholdKbps = prefs.getInt("speed", 512),
@@ -21,6 +28,13 @@ class AppPreferences(context: Context) {
             .putBoolean("enabled", config.enabled)
             .putBoolean("follow_voice", config.followVoice)
             .putBoolean("follow_sms", config.followSms)
+            .putBoolean("wifi_restore_enabled", config.wifiRestoreEnabled)
+            .putBoolean("wifi_data_enabled", config.wifiDataEnabled)
+            .putInt("wifi_data_sub_id", config.wifiDataSubId)
+            .putBoolean("wifi_voice_enabled", config.wifiVoiceEnabled)
+            .putInt("wifi_voice_sub_id", config.wifiVoiceSubId)
+            .putBoolean("wifi_sms_enabled", config.wifiSmsEnabled)
+            .putInt("wifi_sms_sub_id", config.wifiSmsSubId)
             .putInt("interval", config.intervalSeconds)
             .putInt("latency", config.latencyThresholdMs)
             .putInt("speed", config.speedThresholdKbps)
