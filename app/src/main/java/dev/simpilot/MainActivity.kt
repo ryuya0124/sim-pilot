@@ -7,6 +7,7 @@ import android.net.Uri
 import android.os.Build
 import android.os.Bundle
 import android.os.SystemClock
+import android.os.UserManager
 import android.provider.Settings
 import androidx.activity.ComponentActivity
 import androidx.activity.compose.setContent
@@ -109,6 +110,12 @@ class MainActivity : ComponentActivity() {
             SystemClock.elapsedRealtime() - splashStartedAt < 650L
         }
         super.onCreate(savedInstanceState)
+        DiagnosticLog.info(
+            this,
+            "activity_opened",
+            "アプリ画面を起動",
+            mapOf("userUnlocked" to getSystemService(UserManager::class.java).isUserUnlocked),
+        )
         splash.setOnExitAnimationListener { provider ->
             provider.view.animate()
                 .alpha(0f)
@@ -169,6 +176,7 @@ private fun SimPilotApp(repository: SimRepository) {
     var config by remember { mutableStateOf(AppPreferences(context).load()) }
     var showSettings by remember { mutableStateOf(false) }
     var busyRole by remember { mutableStateOf<SimRole?>(null) }
+    val switchAudit = remember { SwitchAudit(context) }
     val scope = rememberCoroutineScope()
 
     val permissionLauncher = rememberLauncherForActivityResult(
@@ -182,7 +190,7 @@ private fun SimPilotApp(repository: SimRepository) {
     }
 
     LaunchedEffect(Unit) {
-        if (config.needsService()) MonitorService.start(context)
+        if (config.needsService()) MonitorService.start(context, reason = "ui_opened")
         val missing = buildList {
             if (ContextCompat.checkSelfPermission(context, Manifest.permission.READ_PHONE_STATE) != PackageManager.PERMISSION_GRANTED) {
                 add(Manifest.permission.READ_PHONE_STATE)
@@ -199,7 +207,29 @@ private fun SimPilotApp(repository: SimRepository) {
     fun persist(next: MonitorConfig) {
         config = next
         AppPreferences(context).save(next)
-        if (next.needsService()) MonitorService.start(context) else MonitorService.stop(context)
+        DiagnosticLog.info(
+            context,
+            "config_changed",
+            "監視設定を変更",
+            mapOf(
+                "monitorEnabled" to next.enabled,
+                "wifiRestoreEnabled" to next.wifiRestoreEnabled,
+                "wifiDataEnabled" to next.wifiDataEnabled,
+                "wifiDataSubId" to next.wifiDataSubId,
+                "wifiVoiceEnabled" to next.wifiVoiceEnabled,
+                "wifiVoiceSubId" to next.wifiVoiceSubId,
+                "wifiSmsEnabled" to next.wifiSmsEnabled,
+                "wifiSmsSubId" to next.wifiSmsSubId,
+                "followVoice" to next.followVoice,
+                "followSms" to next.followSms,
+                "intervalSeconds" to next.intervalSeconds,
+                "latencyThresholdMs" to next.latencyThresholdMs,
+                "speedThresholdKbps" to next.speedThresholdKbps,
+                "consecutiveFailures" to next.consecutiveFailures,
+                "cooldownMinutes" to next.cooldownMinutes,
+            ),
+        )
+        if (next.needsService()) MonitorService.start(context, reason = "config_changed") else MonitorService.stop(context)
     }
 
     fun switch(role: SimRole, subId: Int) {
@@ -209,11 +239,18 @@ private fun SimPilotApp(repository: SimRepository) {
         }
         scope.launch {
             busyRole = role
-            val result = withContext(Dispatchers.IO) { ShizukuBridge.setDefault(role, subId) }
+            val lines = snapshot.lines
+            val result = withContext(Dispatchers.IO) {
+                switchAudit.begin(role, subId, "ui_manual", lines)
+                ShizukuBridge.setDefault(role, subId).also {
+                    switchAudit.result(role, subId, "ui_manual", it)
+                }
+            }
             if (result.isSuccess) {
                 AppState.update { it.copy(status = "${role.label}を切り替えました") }
                 delay(700)
-                repository.refresh()
+                val refreshed = repository.refresh()
+                switchAudit.observe("ui_manual_result", refreshed)
             } else {
                 AppState.update { it.copy(status = result.exceptionOrNull()?.message ?: "切替に失敗しました") }
             }
@@ -265,7 +302,7 @@ private fun SimPilotApp(repository: SimRepository) {
                         config = config,
                         running = snapshot.monitorRunning,
                         onChange = ::persist,
-                        onTest = { MonitorService.start(context, testNow = true) },
+                        onTest = { MonitorService.start(context, testNow = true, reason = "ui_quality_test") },
                     )
                 }
                 item {

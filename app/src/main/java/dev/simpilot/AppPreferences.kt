@@ -54,6 +54,43 @@ class AppPreferences(context: Context) {
         get() = prefs.getLong("last_switch_at", 0L)
         set(value) = prefs.edit().putLong("last_switch_at", value).apply()
 
+    fun observedDefault(role: SimRole): Int? {
+        val key = "audit_observed_${role.name.lowercase()}"
+        return if (prefs.contains(key)) prefs.getInt(key, -1) else null
+    }
+
+    fun setObservedDefault(role: SimRole, subId: Int) {
+        prefs.edit().putInt("audit_observed_${role.name.lowercase()}", subId).apply()
+    }
+
+    fun pendingSwitch(role: SimRole): PendingSwitch? {
+        val prefix = "audit_pending_${role.name.lowercase()}"
+        if (!prefs.contains("${prefix}_target")) return null
+        return PendingSwitch(
+            targetSubId = prefs.getInt("${prefix}_target", -1),
+            origin = prefs.getString("${prefix}_origin", "unknown") ?: "unknown",
+            requestedAt = prefs.getLong("${prefix}_at", 0L),
+        )
+    }
+
+    fun setPendingSwitch(role: SimRole, pending: PendingSwitch) {
+        val prefix = "audit_pending_${role.name.lowercase()}"
+        prefs.edit()
+            .putInt("${prefix}_target", pending.targetSubId)
+            .putString("${prefix}_origin", pending.origin)
+            .putLong("${prefix}_at", pending.requestedAt)
+            .commit()
+    }
+
+    fun clearPendingSwitch(role: SimRole) {
+        val prefix = "audit_pending_${role.name.lowercase()}"
+        prefs.edit()
+            .remove("${prefix}_target")
+            .remove("${prefix}_origin")
+            .remove("${prefix}_at")
+            .apply()
+    }
+
     companion object {
         private const val PREFS_NAME = "sim_pilot"
     }

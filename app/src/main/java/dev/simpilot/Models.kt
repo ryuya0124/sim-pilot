@@ -39,13 +39,6 @@ data class MonitorConfig(
     val cooldownMinutes: Int = 5,
 ) {
     fun needsService(): Boolean = enabled || wifiRestoreEnabled
-
-    fun wifiPolicySignature(): String = listOf(
-        wifiRestoreEnabled,
-        wifiDataEnabled, wifiDataSubId,
-        wifiVoiceEnabled, wifiVoiceSubId,
-        wifiSmsEnabled, wifiSmsSubId,
-    ).joinToString(":")
 }
 
 data class AppSnapshot(

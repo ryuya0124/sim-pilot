@@ -1,7 +1,6 @@
 package dev.simpilot
 
 import org.junit.Assert.assertFalse
-import org.junit.Assert.assertNotEquals
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertTrue
 import org.junit.Test
@@ -62,10 +61,4 @@ class AutoSwitchDeciderTest {
         assertTrue(MonitorConfig(enabled = true).needsService())
     }
 
-    @Test fun eachWifiRoleChangesPolicySignature() {
-        val initial = MonitorConfig().wifiPolicySignature()
-        assertNotEquals(initial, MonitorConfig(wifiDataSubId = 4).wifiPolicySignature())
-        assertNotEquals(initial, MonitorConfig(wifiVoiceEnabled = true).wifiPolicySignature())
-        assertNotEquals(initial, MonitorConfig(wifiSmsEnabled = true).wifiPolicySignature())
-    }
 }

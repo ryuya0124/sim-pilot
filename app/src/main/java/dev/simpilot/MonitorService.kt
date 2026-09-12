@@ -7,17 +7,23 @@ import android.app.NotificationChannel
 import android.app.NotificationManager
 import android.app.PendingIntent
 import android.app.Service
+import android.content.BroadcastReceiver
 import android.content.Context
 import android.content.Intent
+import android.content.IntentFilter
 import android.content.pm.ServiceInfo
+import android.database.ContentObserver
 import android.net.ConnectivityManager
 import android.net.Network
 import android.net.NetworkCapabilities
 import android.net.TelephonyNetworkSpecifier
+import android.net.Uri
 import android.os.Build
 import android.os.Handler
 import android.os.IBinder
 import android.os.Looper
+import android.os.UserManager
+import android.provider.Settings
 import android.telecom.TelecomManager
 import android.telephony.SubscriptionManager
 import android.util.Log
@@ -29,42 +35,119 @@ import java.net.URL
 import java.util.concurrent.Executors
 import java.util.concurrent.atomic.AtomicBoolean
 import kotlin.math.roundToLong
+import rikka.shizuku.Shizuku
 
 class MonitorService : Service() {
     private val worker = Executors.newSingleThreadExecutor()
     private val mainHandler = Handler(Looper.getMainLooper())
     private lateinit var prefs: AppPreferences
+    private lateinit var switchAudit: SwitchAudit
     private lateinit var sims: SimRepository
     private lateinit var connectivity: ConnectivityManager
     private var badSamples = 0
     private var sampleCount = 0
-    private var lastWifiPolicySignature: String? = null
+    private var networkCallbackRegistered = false
+    private var settingsObserverRegistered = false
+    private var shizukuListenersRegistered = false
     private val stopped = AtomicBoolean(false)
     private val networkCallback = object : ConnectivityManager.NetworkCallback() {
         override fun onAvailable(network: Network) = scheduleNext(250)
         override fun onLost(network: Network) = scheduleNext(250)
         override fun onCapabilitiesChanged(network: Network, networkCapabilities: NetworkCapabilities) = scheduleNext(250)
     }
+    private val defaultSubscriptionReceiver = object : BroadcastReceiver() {
+        override fun onReceive(context: Context, intent: Intent?) {
+            DiagnosticLog.info(
+                this@MonitorService,
+                "subscription_event",
+                "既定SIM変更通知を受信",
+                mapOf("action" to intent?.action),
+            )
+            scheduleNext(150)
+        }
+    }
+    private val shizukuReceivedListener = Shizuku.OnBinderReceivedListener {
+        DiagnosticLog.info(this, "shizuku_available", "Shizukuが利用可能になりました")
+        scheduleNext(0)
+    }
+    private val shizukuDeadListener = Shizuku.OnBinderDeadListener {
+        DiagnosticLog.warn(this, "shizuku_unavailable", "Shizukuとの接続が失われました")
+        scheduleNext(0)
+    }
+    private val defaultSettingsObserver = object : ContentObserver(mainHandler) {
+        override fun onChange(selfChange: Boolean, uri: Uri?) {
+            DiagnosticLog.info(
+                this@MonitorService,
+                "subscription_event",
+                "One UIの既定SIM設定変更を検出",
+                mapOf("source" to "settings_observer", "key" to uri?.lastPathSegment),
+            )
+            scheduleNext(150)
+        }
+    }
 
     override fun onCreate() {
         super.onCreate()
         prefs = AppPreferences(this)
+        switchAudit = SwitchAudit(this)
         connectivity = getSystemService(ConnectivityManager::class.java)
         sims = SimRepository(this, mainExecutor)
-        connectivity.registerDefaultNetworkCallback(networkCallback)
+        runCatching { connectivity.registerDefaultNetworkCallback(networkCallback) }
+            .onSuccess { networkCallbackRegistered = true }
+            .onFailure { DiagnosticLog.warn(this, "network_callback_failed", "ネットワーク監視の登録に失敗", error = it) }
         createNotificationChannel()
         startAsForeground("準備中")
+        registerReceiver(
+            defaultSubscriptionReceiver,
+            IntentFilter().apply {
+                addAction(SubscriptionManager.ACTION_DEFAULT_SUBSCRIPTION_CHANGED)
+                addAction(SubscriptionManager.ACTION_DEFAULT_SMS_SUBSCRIPTION_CHANGED)
+                addAction(ACTION_DEFAULT_DATA_SUBSCRIPTION_CHANGED)
+                addAction(ACTION_DEFAULT_VOICE_SUBSCRIPTION_CHANGED)
+            },
+            Context.RECEIVER_NOT_EXPORTED,
+        )
+        runCatching {
+            DEFAULT_SETTING_KEYS.forEach { key ->
+                contentResolver.registerContentObserver(Settings.Global.getUriFor(key), false, defaultSettingsObserver)
+            }
+            settingsObserverRegistered = true
+        }.onFailure {
+            DiagnosticLog.warn(this, "settings_observer_failed", "One UIの既定SIM設定監視を登録できませんでした", error = it)
+        }
+        ensureShizukuListeners()
+        DiagnosticLog.info(
+            this,
+            "service_created",
+            "監視サービスを作成",
+            mapOf(
+                "userUnlocked" to getSystemService(UserManager::class.java).isUserUnlocked,
+                "shizukuReady" to ShizukuBridge.isReady(),
+                "shizukuGranted" to ShizukuBridge.isGranted(),
+            ),
+        )
         AppState.update { it.copy(monitorRunning = true, status = "モニターを準備中") }
     }
 
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
+        ensureShizukuListeners()
+        DiagnosticLog.info(
+            this,
+            "service_started",
+            "監視サービスの開始要求を受信",
+            mapOf(
+                "reason" to intent?.getStringExtra(EXTRA_START_REASON),
+                "action" to intent?.action,
+                "startId" to startId,
+            ),
+        )
         when (intent?.action) {
             ACTION_STOP -> {
                 prefs.save(prefs.load().copy(enabled = false, wifiRestoreEnabled = false))
                 stopSelf()
                 return START_NOT_STICKY
             }
-            ACTION_TEST_NOW -> worker.execute { runCycle(forceDeepProbe = true) }
+            ACTION_TEST_NOW -> enqueueCycle(forceDeepProbe = true)
             else -> scheduleNext(0)
         }
         return START_STICKY
@@ -73,9 +156,16 @@ class MonitorService : Service() {
     override fun onDestroy() {
         stopped.set(true)
         mainHandler.removeCallbacksAndMessages(null)
-        runCatching { connectivity.unregisterNetworkCallback(networkCallback) }
+        if (networkCallbackRegistered) runCatching { connectivity.unregisterNetworkCallback(networkCallback) }
+        if (settingsObserverRegistered) runCatching { contentResolver.unregisterContentObserver(defaultSettingsObserver) }
+        runCatching { unregisterReceiver(defaultSubscriptionReceiver) }
+        if (shizukuListenersRegistered) {
+            runCatching { Shizuku.removeBinderReceivedListener(shizukuReceivedListener) }
+            runCatching { Shizuku.removeBinderDeadListener(shizukuDeadListener) }
+        }
         sims.unregister()
         worker.shutdownNow()
+        DiagnosticLog.info(this, "service_destroyed", "監視サービスを終了")
         AppState.update { it.copy(monitorRunning = false, status = "停止中") }
         super.onDestroy()
     }
@@ -85,8 +175,31 @@ class MonitorService : Service() {
     private fun scheduleNext(delayMs: Long) {
         mainHandler.removeCallbacksAndMessages(null)
         mainHandler.postDelayed({
-            if (!stopped.get()) worker.execute { runCycle(false) }
+            if (!stopped.get()) enqueueCycle(false)
         }, delayMs)
+    }
+
+    private fun enqueueCycle(forceDeepProbe: Boolean) {
+        if (stopped.get() || worker.isShutdown) return
+        worker.execute {
+            runCatching { runCycle(forceDeepProbe) }
+                .onFailure {
+                    DiagnosticLog.error(this, "cycle_failed", "監視周期で予期しないエラー", error = it)
+                    val config = prefs.load()
+                    finishCycle("監視エラー · 次回再試行", config)
+                }
+        }
+    }
+
+    private fun ensureShizukuListeners() {
+        if (shizukuListenersRegistered) return
+        runCatching {
+            Shizuku.addBinderReceivedListenerSticky(shizukuReceivedListener)
+            Shizuku.addBinderDeadListener(shizukuDeadListener)
+            shizukuListenersRegistered = true
+        }.onFailure {
+            DiagnosticLog.warn(this, "shizuku_listener_failed", "Shizuku監視の登録に失敗 · 次回起動イベントで再試行", error = it)
+        }
     }
 
     private fun runCycle(forceDeepProbe: Boolean) {
@@ -96,12 +209,39 @@ class MonitorService : Service() {
             return
         }
         val lines = sims.refresh()
+        val userUnlocked = getSystemService(UserManager::class.java).isUserUnlocked
+        if (userUnlocked) {
+            switchAudit.observe("monitor_cycle", lines)
+        } else {
+            DiagnosticLog.info(this, "default_audit_deferred", "ロック解除前のため既定SIM変更の照合を保留")
+        }
+        val active = connectivity.activeNetwork
+        val activeCaps = active?.let(connectivity::getNetworkCapabilities)
+        DiagnosticLog.info(
+            this,
+            "cycle_started",
+            "通信品質の監視を開始",
+            mapOf(
+                "forced" to forceDeepProbe,
+                "userUnlocked" to userUnlocked,
+                "transport" to when {
+                    activeCaps?.hasTransport(NetworkCapabilities.TRANSPORT_WIFI) == true -> "wifi"
+                    activeCaps?.hasTransport(NetworkCapabilities.TRANSPORT_CELLULAR) == true -> "cellular"
+                    active == null -> "none"
+                    else -> "other"
+                },
+                "lines" to lines.joinToString(",") { "${it.subId}:${it.title}:slot${it.slotIndex + 1}" },
+                "dataSubId" to SubscriptionManager.getDefaultDataSubscriptionId(),
+                "voiceSubId" to SubscriptionManager.getDefaultVoiceSubscriptionId(),
+                "smsSubId" to SubscriptionManager.getDefaultSmsSubscriptionId(),
+                "shizukuReady" to ShizukuBridge.isReady(),
+                "shizukuGranted" to ShizukuBridge.isGranted(),
+            ),
+        )
         if (!sims.hasPhonePermission()) {
             finishCycle("電話の権限を許可してください", config)
             return
         }
-        val active = connectivity.activeNetwork
-        val activeCaps = active?.let(connectivity::getNetworkCapabilities)
         Log.i(
             TAG,
             "cycle force=$forceDeepProbe active=$active wifi=${activeCaps?.hasTransport(NetworkCapabilities.TRANSPORT_WIFI)} " +
@@ -110,12 +250,15 @@ class MonitorService : Service() {
         if (activeCaps?.hasTransport(NetworkCapabilities.TRANSPORT_WIFI) == true) {
             badSamples = 0
             if (!config.wifiRestoreEnabled) {
-                lastWifiPolicySignature = config.wifiPolicySignature()
                 finishCycle("Wi-Fi接続中 · モバイル切替停止", config)
                 return
             }
+            if (!ShizukuBridge.isReady()) {
+                finishCycle("Wi-Fi復帰を保留 · Shizukuの起動待ち", config)
+                return
+            }
             if (!ShizukuBridge.isGranted()) {
-                finishCycle("Wi-Fi復帰にはShizuku権限が必要です", config)
+                finishCycle("Wi-Fi復帰を保留 · Shizuku権限が必要です", config)
                 return
             }
             val inCall = isInCall()
@@ -123,24 +266,22 @@ class MonitorService : Service() {
                 finishCycle("Wi-Fi接続中 · 通話終了後に既定SIMへ復帰", config)
                 return
             }
-            val signature = config.wifiPolicySignature() + ":" + lines.joinToString(",") { it.subId.toString() }
-            val message = if (lastWifiPolicySignature != signature) {
-                applyWifiPolicy(config, lines).also { lastWifiPolicySignature = signature }
-            } else {
-                "Wi-Fi接続中 · 既定SIM復帰済み"
-            }
+            val message = applyWifiPolicy(config, lines)
             finishCycle(message, config)
             return
         }
-        lastWifiPolicySignature = null
 
         if (!config.enabled) {
             finishCycle("モバイル自動切替は停止中", config)
             return
         }
 
+        if (!ShizukuBridge.isReady()) {
+            finishCycle("自動切替を保留 · Shizukuの起動待ち", config)
+            return
+        }
         if (!ShizukuBridge.isGranted()) {
-            finishCycle("Shizuku権限を許可してください", config)
+            finishCycle("自動切替を保留 · Shizuku権限が必要です", config)
             return
         }
         if (lines.size < 2) {
@@ -183,12 +324,34 @@ class MonitorService : Service() {
         AppState.update {
             it.copy(lastLatencyMs = latency, lastSpeedKbps = speed, badSamples = badSamples)
         }
+        DiagnosticLog.info(
+            this,
+            "quality_result",
+            "通信品質を判定",
+            mapOf(
+                "subId" to dataSubId,
+                "name" to current.title,
+                "serviceStateKnown" to current.serviceStateKnown,
+                "inService" to current.inService,
+                "signalLevel" to current.signalLevel,
+                "validated" to validated,
+                "latencyMs" to latency,
+                "latencyThresholdMs" to config.latencyThresholdMs,
+                "speedKbps" to speed,
+                "speedThresholdKbps" to config.speedThresholdKbps,
+                "verdict" to verdict.name.lowercase(),
+                "badSamples" to badSamples,
+                "requiredBadSamples" to config.consecutiveFailures,
+                "alternateSubId" to alternate?.subId,
+                "alternateName" to alternate?.title,
+            ),
+        )
 
         val cooldownMs = config.cooldownMinutes * 60_000L
         val inCooldown = System.currentTimeMillis() - prefs.lastSwitchAt < cooldownMs
         val inCall = isInCall()
         if (badSamples >= config.consecutiveFailures && alternate != null && !inCooldown && !inCall) {
-            switchDataAndFollowers(alternate.subId, config)
+            switchDataAndFollowers(alternate.subId, config, lines)
             badSamples = 0
             val message = "${current.title} → ${alternate.title} に切替"
             finishCycle(message, config)
@@ -209,18 +372,20 @@ class MonitorService : Service() {
             speed?.let { append(" · ${it}kbps") }
             if (badSamples > 0) append(" · 低品質 $badSamples/${config.consecutiveFailures}")
             if (verdict == QualityVerdict.INCONCLUSIVE) append(" · 次回再測定")
+            if (bad && alternate == null) append(" · 利用可能な切替先なし")
             if (inCall) append(" · 通話中は切替保留")
             else if (inCooldown && bad) append(" · クールダウン中")
         }
         finishCycle(detail, config)
     }
 
-    private fun switchDataAndFollowers(subId: Int, config: MonitorConfig) {
-        ShizukuBridge.setDefault(SimRole.DATA, subId).getOrThrow()
-        if (config.followVoice) ShizukuBridge.setDefault(SimRole.VOICE, subId).getOrThrow()
-        if (config.followSms) ShizukuBridge.setDefault(SimRole.SMS, subId).getOrThrow()
+    private fun switchDataAndFollowers(subId: Int, config: MonitorConfig, lines: List<SimLine>) {
+        setDefaultWithAudit(SimRole.DATA, subId, "auto_failover", lines).getOrThrow()
+        if (config.followVoice) setDefaultWithAudit(SimRole.VOICE, subId, "auto_failover_follower", lines).getOrThrow()
+        if (config.followSms) setDefaultWithAudit(SimRole.SMS, subId, "auto_failover_follower", lines).getOrThrow()
         prefs.lastSwitchAt = System.currentTimeMillis()
         AppState.update { it.copy(lastSwitchAt = prefs.lastSwitchAt) }
+        switchAudit.observe("auto_failover_result", lines)
     }
 
     private fun applyWifiPolicy(config: MonitorConfig, lines: List<SimLine>): String {
@@ -245,10 +410,13 @@ class MonitorService : Service() {
                 SimRole.SMS -> SubscriptionManager.getDefaultSmsSubscriptionId()
             }
             if (current == subId) return@forEach
-            ShizukuBridge.setDefault(role, subId)
+            setDefaultWithAudit(role, subId, "wifi_restore", lines)
                 .onSuccess { changed += "${role.label}=${line.title}" }
-                .onFailure { skipped += "${role.label}失敗" }
+                .onFailure {
+                    skipped += "${role.label}失敗"
+                }
         }
+        switchAudit.observe("wifi_restore_result", lines)
         sims.refresh()
         return when {
             changed.isNotEmpty() && skipped.isNotEmpty() -> "Wi-Fi復帰: ${changed.joinToString()} · ${skipped.joinToString()}"
@@ -259,6 +427,34 @@ class MonitorService : Service() {
     }
 
     private fun finishCycle(message: String, config: MonitorConfig) {
+        DiagnosticLog.info(
+            this,
+            "decision",
+            message,
+            mapOf(
+                "monitorEnabled" to config.enabled,
+                "wifiRestoreEnabled" to config.wifiRestoreEnabled,
+                "wifiDataEnabled" to config.wifiDataEnabled,
+                "wifiDataSubId" to config.wifiDataSubId,
+                "wifiVoiceEnabled" to config.wifiVoiceEnabled,
+                "wifiVoiceSubId" to config.wifiVoiceSubId,
+                "wifiSmsEnabled" to config.wifiSmsEnabled,
+                "wifiSmsSubId" to config.wifiSmsSubId,
+                "followVoice" to config.followVoice,
+                "followSms" to config.followSms,
+                "intervalSeconds" to config.intervalSeconds,
+                "latencyThresholdMs" to config.latencyThresholdMs,
+                "speedThresholdKbps" to config.speedThresholdKbps,
+                "requiredBadSamples" to config.consecutiveFailures,
+                "cooldownMinutes" to config.cooldownMinutes,
+                "badSamples" to badSamples,
+                "dataSubId" to SubscriptionManager.getDefaultDataSubscriptionId(),
+                "voiceSubId" to SubscriptionManager.getDefaultVoiceSubscriptionId(),
+                "smsSubId" to SubscriptionManager.getDefaultSmsSubscriptionId(),
+                "shizukuReady" to ShizukuBridge.isReady(),
+                "shizukuGranted" to ShizukuBridge.isGranted(),
+            ),
+        )
         AppState.update {
             it.copy(
                 monitorRunning = config.needsService(),
@@ -270,6 +466,18 @@ class MonitorService : Service() {
         }
         updateNotification(message)
         if (config.needsService() && !stopped.get()) scheduleNext(config.intervalSeconds * 1_000L)
+    }
+
+    private fun setDefaultWithAudit(
+        role: SimRole,
+        subId: Int,
+        origin: String,
+        lines: List<SimLine>,
+    ): Result<Unit> {
+        switchAudit.begin(role, subId, origin, lines)
+        return ShizukuBridge.setDefault(role, subId).also {
+            switchAudit.result(role, subId, origin, it)
+        }
     }
 
     @SuppressLint("MissingPermission")
@@ -301,6 +509,7 @@ class MonitorService : Service() {
         val bound = latencyAttempt { network.openConnection(url) as HttpURLConnection }
         if (bound.isSuccess) return bound.getOrNull()
         Log.i(TAG, "direct probe unavailable on $network; using the app default route")
+        DiagnosticLog.warn(this, "probe_fallback", "SIM固定の遅延測定に失敗し、既定経路で再試行", error = bound.exceptionOrNull())
         var lastFailure: Throwable? = null
         LATENCY_URLS.forEach { endpoint ->
             val result = latencyAttempt { URL(endpoint).openConnection() as HttpURLConnection }
@@ -308,6 +517,7 @@ class MonitorService : Service() {
             lastFailure = result.exceptionOrNull()
         }
         Log.w(TAG, "all latency probes failed: ${lastFailure?.message}", lastFailure)
+        DiagnosticLog.warn(this, "latency_unavailable", "すべての遅延測定先が応答しませんでした", error = lastFailure)
         return null
     }
 
@@ -332,6 +542,7 @@ class MonitorService : Service() {
         val bound = speedAttempt { network.openConnection(url) as HttpURLConnection }
         if (bound.isSuccess) return bound.getOrNull()
         Log.i(TAG, "direct speed probe unavailable on $network; using the app default route")
+        DiagnosticLog.warn(this, "probe_fallback", "SIM固定の速度測定に失敗し、既定経路で再試行", error = bound.exceptionOrNull())
         return speedAttempt { url.openConnection() as HttpURLConnection }
             .onFailure { Log.w(TAG, "default-route speed probe failed: ${it.message}", it) }
             .getOrNull()
@@ -414,12 +625,23 @@ class MonitorService : Service() {
             "https://speed.cloudflare.com/__down?bytes=1",
         )
         private const val SPEED_URL = "https://speed.cloudflare.com/__down?bytes=65536"
+        private const val ACTION_DEFAULT_DATA_SUBSCRIPTION_CHANGED =
+            "android.intent.action.ACTION_DEFAULT_DATA_SUBSCRIPTION_CHANGED"
+        private const val ACTION_DEFAULT_VOICE_SUBSCRIPTION_CHANGED =
+            "android.intent.action.ACTION_DEFAULT_VOICE_SUBSCRIPTION_CHANGED"
+        private const val EXTRA_START_REASON = "dev.simpilot.extra.START_REASON"
+        private val DEFAULT_SETTING_KEYS = listOf(
+            "multi_sim_data_call",
+            "multi_sim_voice_call",
+            "multi_sim_sms",
+        )
         const val ACTION_STOP = "dev.simpilot.STOP"
         const val ACTION_TEST_NOW = "dev.simpilot.TEST_NOW"
 
-        fun start(context: Context, testNow: Boolean = false) {
+        fun start(context: Context, testNow: Boolean = false, reason: String = "unspecified") {
             val intent = Intent(context, MonitorService::class.java)
             if (testNow) intent.action = ACTION_TEST_NOW
+            intent.putExtra(EXTRA_START_REASON, reason)
             ContextCompat.startForegroundService(context, intent)
         }
 

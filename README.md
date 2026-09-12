@@ -17,6 +17,7 @@ Galaxy S26 Ultra（SM-S948Q / One UI 8.5）の DSDV 環境向けに、端末で�
 - 起動直後のServiceState未取得を圏外と区別し、正常な実測値を電波表示だけで低品質にしない
 - Direct Boot対応のForeground Service、再起動・アプリ更新後の監視自動復帰、Android 17のPromoted Ongoing通知
 - Android 12以降のSplashScreen APIを使った、通信リングが回転する起動アニメーション
+- 品質判定、切替保留理由、Shizuku待ち、SIM Pilot／外部からの既定SIM変更を端末内JSONLログへ記録
 - Material Design 3、動的カラー、edge-to-edge、画面幅に応じた適応レイアウト
 
 ## 対応環境
@@ -43,7 +44,23 @@ APKは `app/build/outputs/apk/debug/app-debug.apk` に生成されます。
 4. 「データSIMを自動切替」をONにします。
 5. 安定運用のため、端末設定でSIM Pilotをバッテリー最適化の対象外にします。
 
-監視またはWi-Fi復帰が有効なら、端末再起動後は画面を開かずに監視サービスを自動起動します。設定はDirect Boot領域に保存されるため、ロック解除前の起動イベントでも復帰できます。SIMの変更にはShizuku側も起動済みである必要があり、未起動の場合は監視を続けながらShizukuの準備を待ちます。
+監視またはWi-Fi復帰が有効なら、端末再起動後は画面を開かずに監視サービスを自動起動します。設定はDirect Boot領域に保存されるため、ロック解除前の起動イベントでも復帰できます。ロック解除前は通常Shizukuが未起動なので切替を行わず、「Shizukuの起動待ち」としてログへ記録します。解除後またはShizuku復帰通知を受けると即座に再評価します。
+
+## 診断ログ
+
+最大約10MB（2MB×現在分＋4世代）のJSON Lines形式で、Direct Boot対応のアプリ専用領域に保存します。電話番号、ICCID、IMSI、IMEIは記録しません。各監視周期には通信経路、SIM名／ID、既定SIM、品質値としきい値、判定、切替しなかった理由、Shizuku状態を含みます。SIM Pilotが要求した変更は `app/ui_manual`、`app/auto_failover`、`app/wifi_restore`、それ以外の変更は `external_user_or_system` と記録します。
+
+接続中の端末からログと現在のシステム状態をまとめて取得できます。
+
+```bash
+./tools/pull-device-logs.sh 192.168.3.13:5555
+```
+
+現在ログだけを直接読む場合:
+
+```bash
+adb -s 192.168.3.13:5555 exec-out run-as dev.simpilot cat /data/user_de/0/dev.simpilot/files/diagnostics/sim-pilot-current.jsonl
+```
 
 設定画面の「Wi-Fi接続時」では、復帰機能全体とデータ・通話・メッセージの各対象を独立してON/OFFできます。「現在の既定SIMを復帰先にセット」を使うと、現在の3つの割り当てをまとめて記録できます。SIM名やSIMの有無は `SubscriptionManager` から毎回取得し、通信会社名をコードへ固定していません。
 
