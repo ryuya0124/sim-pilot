@@ -14,6 +14,7 @@ Galaxy S26 Ultra（SM-S948Q / One UI 8.5）の DSDV 環境向けに、端末で�
 - 応答時間、電波状態、ネットワーク検証、64KB実効速度テストを組み合わせた判定
 - VPNやIMS・MMSなどの専用ネットワークを除外し、既定SIMの物理的な通常インターネット経路だけを測定
 - 遅延測定は複数エンドポイントで再試行し、一時的な測定不能は低品質へ加算せず次回へ保留
+- 起動直後のServiceState未取得を圏外と区別し、正常な実測値を電波表示だけで低品質にしない
 - Foreground Service、再起動後の監視復帰、Android 17のPromoted Ongoing通知
 - Material Design 3、動的カラー、edge-to-edge、画面幅に応じた適応レイアウト
 

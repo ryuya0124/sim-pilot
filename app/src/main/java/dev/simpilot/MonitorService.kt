@@ -164,7 +164,14 @@ class MonitorService : Service() {
         val shouldMeasureSpeed = forceDeepProbe || latency == null || latency > config.latencyThresholdMs || sampleCount % 10 == 0
         val speed = if (shouldMeasureSpeed) cellularNetwork?.let(::speedProbe) else null
         Log.i(TAG, "probe subId=$dataSubId network=$cellularNetwork validated=$validated latencyMs=$latency speedKbps=$speed")
-        val sample = QualitySample(current.inService, current.signalLevel, validated, latency, speed)
+        val sample = QualitySample(
+            inService = current.inService,
+            serviceStateKnown = current.serviceStateKnown,
+            signalLevel = current.signalLevel,
+            validated = validated,
+            latencyMs = latency,
+            speedKbps = speed,
+        )
         val verdict = AutoSwitchDecider.evaluate(sample, config)
         val bad = verdict == QualityVerdict.BAD
         badSamples = when (verdict) {

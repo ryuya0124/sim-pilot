@@ -14,6 +14,7 @@ data class SimLine(
     val signalLevel: Int = -1,
     val dbm: Int? = null,
     val inService: Boolean = false,
+    val serviceStateKnown: Boolean = false,
     val networkType: String = "—",
 ) {
     val title: String get() = displayName.ifBlank { carrierName.ifBlank { "SIM ${slotIndex + 1}" } }

@@ -25,6 +25,7 @@ class SimRepository(private val context: Context, private val executor: Executor
         val level: Int = -1,
         val dbm: Int? = null,
         val inService: Boolean = false,
+        val serviceStateKnown: Boolean = false,
         val networkType: String = "—",
     )
 
@@ -45,7 +46,10 @@ class SimRepository(private val context: Context, private val executor: Executor
 
         override fun onServiceStateChanged(serviceState: ServiceState) {
             observations.compute(subId) { _, old ->
-                (old ?: Observation()).copy(inService = serviceState.state == ServiceState.STATE_IN_SERVICE)
+                (old ?: Observation()).copy(
+                    inService = serviceState.state == ServiceState.STATE_IN_SERVICE,
+                    serviceStateKnown = true,
+                )
             }
             publish()
         }
@@ -93,6 +97,7 @@ class SimRepository(private val context: Context, private val executor: Executor
                 signalLevel = o.level,
                 dbm = o.dbm,
                 inService = o.inService,
+                serviceStateKnown = o.serviceStateKnown,
                 networkType = o.networkType,
             )
         }
