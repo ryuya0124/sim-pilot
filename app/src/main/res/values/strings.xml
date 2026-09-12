@@ -1,0 +1,5 @@
+<resources>
+    <string name="app_name">SIM Pilot</string>
+    <string name="monitor_channel_name">回線モニター</string>
+    <string name="monitor_channel_description">デュアルSIMの通信品質を監視して自動切替します</string>
+</resources>

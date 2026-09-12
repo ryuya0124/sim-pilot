@@ -1,0 +1,79 @@
+package dev.simpilot
+
+enum class SimRole(val label: String, val transactionCode: Int) {
+    DATA("データ", 31),
+    VOICE("通話", 34),
+    SMS("メッセージ", 37),
+}
+
+data class SimLine(
+    val subId: Int,
+    val slotIndex: Int,
+    val displayName: String,
+    val carrierName: String,
+    val signalLevel: Int = -1,
+    val dbm: Int? = null,
+    val inService: Boolean = false,
+    val networkType: String = "—",
+) {
+    val title: String get() = displayName.ifBlank { carrierName.ifBlank { "SIM ${slotIndex + 1}" } }
+    val subtitle: String get() = "SIM ${slotIndex + 1} · ${carrierName.ifBlank { "回線" }}"
+}
+
+data class MonitorConfig(
+    val enabled: Boolean = false,
+    val followVoice: Boolean = false,
+    val followSms: Boolean = false,
+    val intervalSeconds: Int = 30,
+    val latencyThresholdMs: Int = 1200,
+    val speedThresholdKbps: Int = 512,
+    val consecutiveFailures: Int = 3,
+    val cooldownMinutes: Int = 5,
+)
+
+data class AppSnapshot(
+    val lines: List<SimLine> = emptyList(),
+    val dataSubId: Int = -1,
+    val voiceSubId: Int = -1,
+    val smsSubId: Int = -1,
+    val shizukuReady: Boolean = false,
+    val shizukuGranted: Boolean = false,
+    val monitorRunning: Boolean = false,
+    val status: String = "初期化中",
+    val lastLatencyMs: Long? = null,
+    val lastSpeedKbps: Long? = null,
+    val badSamples: Int = 0,
+    val lastSwitchAt: Long? = null,
+)
+
+object AppState {
+    private val lock = Any()
+    private var value = AppSnapshot()
+    private val listeners = LinkedHashSet<(AppSnapshot) -> Unit>()
+
+    fun current(): AppSnapshot = synchronized(lock) { value }
+
+    fun update(block: (AppSnapshot) -> AppSnapshot) {
+        val next: AppSnapshot
+        val targets: List<(AppSnapshot) -> Unit>
+        synchronized(lock) {
+            next = block(value)
+            value = next
+            targets = listeners.toList()
+        }
+        targets.forEach { it(next) }
+    }
+
+    fun addListener(listener: (AppSnapshot) -> Unit) {
+        val snapshot: AppSnapshot
+        synchronized(lock) {
+            listeners += listener
+            snapshot = value
+        }
+        listener(snapshot)
+    }
+
+    fun removeListener(listener: (AppSnapshot) -> Unit) {
+        synchronized(lock) { listeners -= listener }
+    }
+}
