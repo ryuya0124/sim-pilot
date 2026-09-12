@@ -3,7 +3,14 @@ package dev.simpilot
 import android.content.Context
 
 class AppPreferences(context: Context) {
-    private val prefs = context.getSharedPreferences("sim_pilot", Context.MODE_PRIVATE)
+    private val storageContext = if (context.isDeviceProtectedStorage) {
+        context
+    } else {
+        context.createDeviceProtectedStorageContext().also {
+            it.moveSharedPreferencesFrom(context, PREFS_NAME)
+        }
+    }
+    private val prefs = storageContext.getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE)
 
     fun load(): MonitorConfig = MonitorConfig(
         enabled = prefs.getBoolean("enabled", false),
@@ -46,4 +53,8 @@ class AppPreferences(context: Context) {
     var lastSwitchAt: Long
         get() = prefs.getLong("last_switch_at", 0L)
         set(value) = prefs.edit().putLong("last_switch_at", value).apply()
+
+    companion object {
+        private const val PREFS_NAME = "sim_pilot"
+    }
 }

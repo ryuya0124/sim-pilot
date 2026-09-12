@@ -15,7 +15,8 @@ Galaxy S26 Ultra（SM-S948Q / One UI 8.5）の DSDV 環境向けに、端末で�
 - VPNやIMS・MMSなどの専用ネットワークを除外し、既定SIMの物理的な通常インターネット経路だけを測定
 - 遅延測定は複数エンドポイントで再試行し、一時的な測定不能は低品質へ加算せず次回へ保留
 - 起動直後のServiceState未取得を圏外と区別し、正常な実測値を電波表示だけで低品質にしない
-- Foreground Service、再起動後の監視復帰、Android 17のPromoted Ongoing通知
+- Direct Boot対応のForeground Service、再起動・アプリ更新後の監視自動復帰、Android 17のPromoted Ongoing通知
+- Android 12以降のSplashScreen APIを使った、通信リングが回転する起動アニメーション
 - Material Design 3、動的カラー、edge-to-edge、画面幅に応じた適応レイアウト
 
 ## 対応環境
@@ -41,6 +42,8 @@ APKは `app/build/outputs/apk/debug/app-debug.apk` に生成されます。
 3. Shizukuのアクセス許可を与えます。
 4. 「データSIMを自動切替」をONにします。
 5. 安定運用のため、端末設定でSIM Pilotをバッテリー最適化の対象外にします。
+
+監視またはWi-Fi復帰が有効なら、端末再起動後は画面を開かずに監視サービスを自動起動します。設定はDirect Boot領域に保存されるため、ロック解除前の起動イベントでも復帰できます。SIMの変更にはShizuku側も起動済みである必要があり、未起動の場合は監視を続けながらShizukuの準備を待ちます。
 
 設定画面の「Wi-Fi接続時」では、復帰機能全体とデータ・通話・メッセージの各対象を独立してON/OFFできます。「現在の既定SIMを復帰先にセット」を使うと、現在の3つの割り当てをまとめて記録できます。SIM名やSIMの有無は `SubscriptionManager` から毎回取得し、通信会社名をコードへ固定していません。
 

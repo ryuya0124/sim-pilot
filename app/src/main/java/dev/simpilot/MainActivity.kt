@@ -6,6 +6,7 @@ import android.content.pm.PackageManager
 import android.net.Uri
 import android.os.Build
 import android.os.Bundle
+import android.os.SystemClock
 import android.provider.Settings
 import androidx.activity.ComponentActivity
 import androidx.activity.compose.setContent
@@ -89,6 +90,7 @@ import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import androidx.core.content.ContextCompat
+import androidx.core.splashscreen.SplashScreen.Companion.installSplashScreen
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.launch
@@ -101,7 +103,21 @@ class MainActivity : ComponentActivity() {
     private val permissionListener = Shizuku.OnRequestPermissionResultListener { _, _ -> refresh() }
 
     override fun onCreate(savedInstanceState: Bundle?) {
+        val splashStartedAt = SystemClock.elapsedRealtime()
+        val splash = installSplashScreen()
+        splash.setKeepOnScreenCondition {
+            SystemClock.elapsedRealtime() - splashStartedAt < 650L
+        }
         super.onCreate(savedInstanceState)
+        splash.setOnExitAnimationListener { provider ->
+            provider.view.animate()
+                .alpha(0f)
+                .scaleX(1.06f)
+                .scaleY(1.06f)
+                .setDuration(260L)
+                .withEndAction(provider::remove)
+                .start()
+        }
         enableEdgeToEdge()
         repository = SimRepository(this, mainExecutor)
         Shizuku.addBinderReceivedListenerSticky(binderListener)
