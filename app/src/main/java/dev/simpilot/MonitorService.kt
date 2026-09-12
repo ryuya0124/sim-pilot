@@ -596,7 +596,6 @@ class MonitorService : Service() {
                 badSamples = badSamples,
             )
         }
-        updateNotification(message)
         if (config.needsService() && !stopped.get()) scheduleNext(nextCheckMs)
     }
 
@@ -760,7 +759,6 @@ class MonitorService : Service() {
             .setOngoing(true)
             .setOnlyAlertOnce(true)
             .setCategory(NotificationCompat.CATEGORY_SERVICE)
-            .setRequestPromotedOngoing(true)
             .addAction(0, "停止", stopIntent)
             .build()
     }
@@ -772,10 +770,6 @@ class MonitorService : Service() {
         } else {
             startForeground(NOTIFICATION_ID, n)
         }
-    }
-
-    private fun updateNotification(message: String) {
-        getSystemService(NotificationManager::class.java).notify(NOTIFICATION_ID, notification(message))
     }
 
     companion object {

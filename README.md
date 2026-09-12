@@ -17,7 +17,8 @@ Galaxy S26 Ultra（SM-S948Q / One UI 8.5）を最優先の検証端末としつ�
 - VPNやIMS・MMSなどの専用ネットワークを除外し、既定SIMの物理的な通常インターネット経路だけを測定
 - 遅延測定は複数エンドポイントで再試行し、一時的な測定不能は低品質へ加算せず次回へ保留
 - 起動直後のServiceState未取得を圏外と区別し、正常な実測値を電波表示だけで低品質にしない
-- Direct Boot対応のForeground Service、再起動・アプリ更新後の監視自動復帰、Android 17のPromoted Ongoing通知
+- Direct Boot対応のForeground Service、再起動・アプリ更新後の監視自動復帰
+- Android 13以降では通知権限を要求せず、監視中も通知ドロワーへ表示しない
 - Android 12以降のSplashScreen APIを使った、通信リングが回転する起動アニメーション
 - 品質判定、切替保留理由、Shizuku待ち、SIM Pilot／外部からの既定SIM変更を端末内JSONLログへ記録
 - 実機の `ISub` Binder Stubからデータ・通話・SMSのtransactionを動的解決し、OEM／Androidバージョン差へ追従
@@ -44,12 +45,14 @@ APKは `app/build/outputs/apk/debug/app-debug.apk` に生成されます。
 ## 初期設定
 
 1. ShizukuまたはShizuku Plusをワイヤレスデバッグ／ADBで起動します。
-2. SIM Pilotを開き、電話・位置情報・通知を許可します。
+2. SIM Pilotを開き、電話・位置情報を許可します。
 3. Shizukuのアクセス許可を与えます。
 4. 「データSIMを自動切替」をONにします。
 5. 安定運用のため、端末設定でSIM Pilotをバッテリー最適化の対象外にします。
 
 監視またはWi-Fi復帰が有効なら、端末再起動後は画面を開かずに監視サービスを自動起動します。設定はDirect Boot領域に保存されるため、ロック解除前の起動イベントでも復帰できます。ロック解除前は通常Shizukuが未起動なので切替を行わず、「Shizukuの起動待ち」としてログへ記録します。端末のロックが外れるたびに強制チェックを1回予約し、モバイル接続中なら速度も測定します。Shizukuが後から復帰した場合も同様に即時再評価し、同時に届く解除通知による二重測定は抑制します。
+
+Android 13以降では通知権限を宣言・要求しないため、監視通知は通知ドロワーへ表示されません。Foreground Service自体はAndroidの要件として維持され、システムの「実行中のアプリ」管理画面には表示されます。Android 12ではOS仕様上Foreground Service通知を完全には隠せません。
 
 ## 診断ログ
 

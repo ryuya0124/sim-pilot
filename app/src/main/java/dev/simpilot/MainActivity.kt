@@ -206,9 +206,6 @@ private fun SimPilotApp(repository: SimRepository) {
                 add(Manifest.permission.ACCESS_COARSE_LOCATION)
                 add(Manifest.permission.ACCESS_FINE_LOCATION)
             }
-            if (Build.VERSION.SDK_INT >= 33 && ContextCompat.checkSelfPermission(context, Manifest.permission.POST_NOTIFICATIONS) != PackageManager.PERMISSION_GRANTED) {
-                add(Manifest.permission.POST_NOTIFICATIONS)
-            }
         }
         if (missing.isNotEmpty()) permissionLauncher.launch(missing.toTypedArray())
     }
