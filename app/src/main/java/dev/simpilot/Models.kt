@@ -1,9 +1,18 @@
 package dev.simpilot
 
-enum class SimRole(val label: String, val transactionCode: Int) {
-    DATA("データ", 31),
-    VOICE("通話", 34),
-    SMS("メッセージ", 37),
+enum class SimRole(val label: String) {
+    DATA("データ"),
+    VOICE("通話"),
+    SMS("メッセージ"),
+}
+
+data class SwitchBackendInfo(
+    val id: String,
+    val label: String,
+    val supportedRoles: Set<SimRole>,
+    val raw: String,
+) {
+    fun supports(role: SimRole): Boolean = role in supportedRoles
 }
 
 data class SimLine(
@@ -48,6 +57,9 @@ data class AppSnapshot(
     val smsSubId: Int = -1,
     val shizukuReady: Boolean = false,
     val shizukuGranted: Boolean = false,
+    val switchBackend: String = "切替方式を確認中",
+    val backendChecked: Boolean = false,
+    val supportedRoles: Set<SimRole> = emptySet(),
     val monitorRunning: Boolean = false,
     val status: String = "初期化中",
     val lastLatencyMs: Long? = null,

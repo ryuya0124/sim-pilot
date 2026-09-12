@@ -49,6 +49,7 @@ class MonitorService : Service() {
     private var networkCallbackRegistered = false
     private var settingsObserverRegistered = false
     private var shizukuListenersRegistered = false
+    @Volatile private var backendInfo: SwitchBackendInfo? = null
     private val stopped = AtomicBoolean(false)
     private val networkCallback = object : ConnectivityManager.NetworkCallback() {
         override fun onAvailable(network: Network) = scheduleNext(250)
@@ -67,10 +68,15 @@ class MonitorService : Service() {
         }
     }
     private val shizukuReceivedListener = Shizuku.OnBinderReceivedListener {
+        backendInfo = null
         DiagnosticLog.info(this, "shizuku_available", "Shizukuが利用可能になりました")
         scheduleNext(0)
     }
     private val shizukuDeadListener = Shizuku.OnBinderDeadListener {
+        backendInfo = null
+        AppState.update {
+            it.copy(switchBackend = "Shizukuの起動待ち", backendChecked = false, supportedRoles = emptySet())
+        }
         DiagnosticLog.warn(this, "shizuku_unavailable", "Shizukuとの接続が失われました")
         scheduleNext(0)
     }
@@ -261,12 +267,16 @@ class MonitorService : Service() {
                 finishCycle("Wi-Fi復帰を保留 · Shizuku権限が必要です", config)
                 return
             }
+            val backend = resolveBackendInfo() ?: run {
+                finishCycle("Wi-Fi復帰を保留 · 端末の切替方式を確認できません", config)
+                return
+            }
             val inCall = isInCall()
             if (inCall) {
                 finishCycle("Wi-Fi接続中 · 通話終了後に既定SIMへ復帰", config)
                 return
             }
-            val message = applyWifiPolicy(config, lines)
+            val message = applyWifiPolicy(config, lines, backend)
             finishCycle(message, config)
             return
         }
@@ -282,6 +292,14 @@ class MonitorService : Service() {
         }
         if (!ShizukuBridge.isGranted()) {
             finishCycle("自動切替を保留 · Shizuku権限が必要です", config)
+            return
+        }
+        val backend = resolveBackendInfo() ?: run {
+            finishCycle("自動切替を保留 · 端末の切替方式を確認できません", config)
+            return
+        }
+        if (!backend.supports(SimRole.DATA)) {
+            finishCycle("自動切替を保留 · この端末ではデータSIM切替未対応", config)
             return
         }
         if (lines.size < 2) {
@@ -351,6 +369,16 @@ class MonitorService : Service() {
         val inCooldown = System.currentTimeMillis() - prefs.lastSwitchAt < cooldownMs
         val inCall = isInCall()
         if (badSamples >= config.consecutiveFailures && alternate != null && !inCooldown && !inCall) {
+            val requiredRoles = buildSet {
+                add(SimRole.DATA)
+                if (config.followVoice) add(SimRole.VOICE)
+                if (config.followSms) add(SimRole.SMS)
+            }
+            val unsupported = requiredRoles - backend.supportedRoles
+            if (unsupported.isNotEmpty()) {
+                finishCycle("自動切替を保留 · ${unsupported.joinToString { it.label }}の切替方式が未対応", config)
+                return
+            }
             switchDataAndFollowers(alternate.subId, config, lines)
             badSamples = 0
             val message = "${current.title} → ${alternate.title} に切替"
@@ -388,7 +416,11 @@ class MonitorService : Service() {
         switchAudit.observe("auto_failover_result", lines)
     }
 
-    private fun applyWifiPolicy(config: MonitorConfig, lines: List<SimLine>): String {
+    private fun applyWifiPolicy(
+        config: MonitorConfig,
+        lines: List<SimLine>,
+        backend: SwitchBackendInfo,
+    ): String {
         val requested = buildList {
             if (config.wifiDataEnabled) add(SimRole.DATA to config.wifiDataSubId)
             if (config.wifiVoiceEnabled) add(SimRole.VOICE to config.wifiVoiceSubId)
@@ -399,6 +431,10 @@ class MonitorService : Service() {
         val changed = mutableListOf<String>()
         val skipped = mutableListOf<String>()
         requested.forEach { (role, subId) ->
+            if (!backend.supports(role)) {
+                skipped += "${role.label}未対応"
+                return@forEach
+            }
             val line = lines.firstOrNull { it.subId == subId }
             if (line == null) {
                 skipped += if (subId < 0) "${role.label}SIM未設定" else "${role.label}SIM未検出"
@@ -478,6 +514,37 @@ class MonitorService : Service() {
         return ShizukuBridge.setDefault(role, subId).also {
             switchAudit.result(role, subId, origin, it)
         }
+    }
+
+    private fun resolveBackendInfo(): SwitchBackendInfo? {
+        backendInfo?.let { return it }
+        val result = ShizukuBridge.backendInfo()
+        result.onSuccess { info ->
+            backendInfo = info
+            AppState.update {
+                it.copy(
+                    switchBackend = info.label,
+                    backendChecked = true,
+                    supportedRoles = info.supportedRoles,
+                )
+            }
+            DiagnosticLog.info(
+                this,
+                "switch_backend_detected",
+                "端末のSIM切替方式を検出",
+                mapOf(
+                    "backend" to info.id,
+                    "roles" to info.supportedRoles.joinToString(",") { it.name.lowercase() },
+                    "descriptor" to info.raw,
+                ),
+            )
+        }.onFailure {
+            AppState.update {
+                it.copy(switchBackend = "切替方式を確認できません", backendChecked = true, supportedRoles = emptySet())
+            }
+            DiagnosticLog.warn(this, "switch_backend_failed", "端末のSIM切替方式を確認できませんでした", error = it)
+        }
+        return result.getOrNull()
     }
 
     @SuppressLint("MissingPermission")

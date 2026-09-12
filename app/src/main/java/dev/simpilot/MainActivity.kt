@@ -145,10 +145,19 @@ class MainActivity : ComponentActivity() {
     }
 
     private fun refresh() {
+        val ready = ShizukuBridge.isReady()
+        val granted = ready && ShizukuBridge.isGranted()
         AppState.update {
             it.copy(
-                shizukuReady = ShizukuBridge.isReady(),
-                shizukuGranted = ShizukuBridge.isGranted(),
+                shizukuReady = ready,
+                shizukuGranted = granted,
+                switchBackend = when {
+                    !ready -> "Shizukuの起動待ち"
+                    !granted -> "Shizuku許可後に確認"
+                    else -> it.switchBackend
+                },
+                backendChecked = if (granted) it.backendChecked else false,
+                supportedRoles = if (granted) it.supportedRoles else emptySet(),
             )
         }
         repository.refresh()
@@ -204,6 +213,35 @@ private fun SimPilotApp(repository: SimRepository) {
         if (missing.isNotEmpty()) permissionLauncher.launch(missing.toTypedArray())
     }
 
+    LaunchedEffect(snapshot.shizukuReady, snapshot.shizukuGranted) {
+        if (!snapshot.shizukuReady || !snapshot.shizukuGranted) return@LaunchedEffect
+        val result = withContext(Dispatchers.IO) { ShizukuBridge.backendInfo() }
+        result.onSuccess { info ->
+            AppState.update {
+                it.copy(
+                    switchBackend = info.label,
+                    backendChecked = true,
+                    supportedRoles = info.supportedRoles,
+                )
+            }
+            DiagnosticLog.info(
+                context,
+                "switch_backend_detected",
+                "アプリ画面で端末のSIM切替方式を確認",
+                mapOf(
+                    "backend" to info.id,
+                    "roles" to info.supportedRoles.joinToString(",") { it.name.lowercase() },
+                    "descriptor" to info.raw,
+                ),
+            )
+        }.onFailure {
+            AppState.update {
+                it.copy(switchBackend = "切替方式を確認できません", backendChecked = true, supportedRoles = emptySet())
+            }
+            DiagnosticLog.warn(context, "switch_backend_failed", "アプリ画面で切替方式を確認できませんでした", error = it)
+        }
+    }
+
     fun persist(next: MonitorConfig) {
         config = next
         AppPreferences(context).save(next)
@@ -233,6 +271,10 @@ private fun SimPilotApp(repository: SimRepository) {
     }
 
     fun switch(role: SimRole, subId: Int) {
+        if (snapshot.backendChecked && role !in snapshot.supportedRoles) {
+            AppState.update { it.copy(status = "この端末では${role.label}SIM切替に未対応です") }
+            return
+        }
         if (!snapshot.shizukuGranted) {
             if (snapshot.shizukuReady) ShizukuBridge.requestPermission(REQUEST_SHIZUKU)
             return
@@ -301,6 +343,7 @@ private fun SimPilotApp(repository: SimRepository) {
                     AutoCard(
                         config = config,
                         running = snapshot.monitorRunning,
+                        backend = snapshot.switchBackend,
                         onChange = ::persist,
                         onTest = { MonitorService.start(context, testNow = true, reason = "ui_quality_test") },
                     )
@@ -318,15 +361,15 @@ private fun SimPilotApp(repository: SimRepository) {
                         val wide = maxWidth >= 720.dp
                         if (wide) {
                             Row(horizontalArrangement = Arrangement.spacedBy(12.dp)) {
-                                RoleCard(SimRole.DATA, snapshot.dataSubId, snapshot.lines, busyRole, Modifier.weight(1f), ::switch)
-                                RoleCard(SimRole.VOICE, snapshot.voiceSubId, snapshot.lines, busyRole, Modifier.weight(1f), ::switch)
-                                RoleCard(SimRole.SMS, snapshot.smsSubId, snapshot.lines, busyRole, Modifier.weight(1f), ::switch)
+                                RoleCard(SimRole.DATA, snapshot.dataSubId, snapshot.lines, busyRole, !snapshot.backendChecked || SimRole.DATA in snapshot.supportedRoles, Modifier.weight(1f), ::switch)
+                                RoleCard(SimRole.VOICE, snapshot.voiceSubId, snapshot.lines, busyRole, !snapshot.backendChecked || SimRole.VOICE in snapshot.supportedRoles, Modifier.weight(1f), ::switch)
+                                RoleCard(SimRole.SMS, snapshot.smsSubId, snapshot.lines, busyRole, !snapshot.backendChecked || SimRole.SMS in snapshot.supportedRoles, Modifier.weight(1f), ::switch)
                             }
                         } else {
                             Column(verticalArrangement = Arrangement.spacedBy(12.dp)) {
-                                RoleCard(SimRole.DATA, snapshot.dataSubId, snapshot.lines, busyRole, Modifier.fillMaxWidth(), ::switch)
-                                RoleCard(SimRole.VOICE, snapshot.voiceSubId, snapshot.lines, busyRole, Modifier.fillMaxWidth(), ::switch)
-                                RoleCard(SimRole.SMS, snapshot.smsSubId, snapshot.lines, busyRole, Modifier.fillMaxWidth(), ::switch)
+                                RoleCard(SimRole.DATA, snapshot.dataSubId, snapshot.lines, busyRole, !snapshot.backendChecked || SimRole.DATA in snapshot.supportedRoles, Modifier.fillMaxWidth(), ::switch)
+                                RoleCard(SimRole.VOICE, snapshot.voiceSubId, snapshot.lines, busyRole, !snapshot.backendChecked || SimRole.VOICE in snapshot.supportedRoles, Modifier.fillMaxWidth(), ::switch)
+                                RoleCard(SimRole.SMS, snapshot.smsSubId, snapshot.lines, busyRole, !snapshot.backendChecked || SimRole.SMS in snapshot.supportedRoles, Modifier.fillMaxWidth(), ::switch)
                             }
                         }
                     }
@@ -428,7 +471,13 @@ private fun ShizukuCard(ready: Boolean, onRequest: () -> Unit) {
 }
 
 @Composable
-private fun AutoCard(config: MonitorConfig, running: Boolean, onChange: (MonitorConfig) -> Unit, onTest: () -> Unit) {
+private fun AutoCard(
+    config: MonitorConfig,
+    running: Boolean,
+    backend: String,
+    onChange: (MonitorConfig) -> Unit,
+    onTest: () -> Unit,
+) {
     val container by animateColorAsState(
         if (config.enabled) MaterialTheme.colorScheme.primaryContainer else MaterialTheme.colorScheme.surfaceContainerHigh,
         label = "autoColor",
@@ -457,6 +506,11 @@ private fun AutoCard(config: MonitorConfig, running: Boolean, onChange: (Monitor
                 Spacer(Modifier.width(8.dp))
                 Text("今すぐ品質テスト")
             }
+            Row(verticalAlignment = Alignment.CenterVertically) {
+                Icon(Icons.Rounded.Shield, null, modifier = Modifier.size(16.dp), tint = MaterialTheme.colorScheme.onSurfaceVariant)
+                Spacer(Modifier.width(7.dp))
+                Text("切替方式: $backend", style = MaterialTheme.typography.labelSmall, color = MaterialTheme.colorScheme.onSurfaceVariant)
+            }
         }
     }
 }
@@ -475,6 +529,7 @@ private fun RoleCard(
     selectedSubId: Int,
     lines: List<SimLine>,
     busyRole: SimRole?,
+    roleSupported: Boolean,
     modifier: Modifier,
     onSelect: (SimRole, Int) -> Unit,
 ) {
@@ -501,13 +556,15 @@ private fun RoleCard(
                     FilterChip(
                         selected = selectedSubId == line.subId,
                         onClick = { onSelect(role, line.subId) },
-                        enabled = busyRole == null,
+                        enabled = busyRole == null && roleSupported,
                         label = { Text(line.title, maxLines = 1, overflow = TextOverflow.Ellipsis) },
                     )
                 }
             }
             if (lines.isEmpty()) {
                 Text("有効なSIMがありません", style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.onSurfaceVariant)
+            } else if (!roleSupported) {
+                Text("この端末では${role.label}SIMの切替方式を検出できません", style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.error)
             }
         }
     }

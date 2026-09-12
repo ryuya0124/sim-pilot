@@ -1,6 +1,6 @@
 # SIM Pilot
 
-Galaxy S26 Ultra（SM-S948Q / One UI 8.5）の DSDV 環境向けに、端末で検出した回線の既定SIMを管理するAndroidアプリです。
+Galaxy S26 Ultra（SM-S948Q / One UI 8.5）を最優先の検証端末としつつ、他のAndroid DSDV端末でも実機の能力を検出して既定SIMを管理するAndroidアプリです。
 
 ## 主な機能
 
@@ -18,15 +18,18 @@ Galaxy S26 Ultra（SM-S948Q / One UI 8.5）の DSDV 環境向けに、端末で�
 - Direct Boot対応のForeground Service、再起動・アプリ更新後の監視自動復帰、Android 17のPromoted Ongoing通知
 - Android 12以降のSplashScreen APIを使った、通信リングが回転する起動アニメーション
 - 品質判定、切替保留理由、Shizuku待ち、SIM Pilot／外部からの既定SIM変更を端末内JSONLログへ記録
+- 実機の `ISub` Binder Stubからデータ・通話・SMSのtransactionを動的解決し、OEM／Androidバージョン差へ追従
+- 切替方式を検出できない役割は操作を無効化し、誤ったBinder呼び出しを防止
 - Material Design 3、動的カラー、edge-to-edge、画面幅に応じた適応レイアウト
 
 ## 対応環境
 
 - `compileSdk 37` / `targetSdk 37` / `minSdk 31`
-- Galaxy S26 Ultra SM-S948Q、Android 16、One UI 8.5で実機検証
+- Galaxy S26 Ultra SM-S948Q、Android 16、One UI 8.5で全機能を実機検証（最優先プロファイル）
+- その他のAndroid 12以降は、実機の内部 `ISub` メソッドを安全に解決できた役割のみ利用可能
 - Shizuku または Shizuku Plus が必要（ADB権限で起動）
 
-SIM切替はSamsung One UI 8.5で確認した `ISub` transactionをShizuku UserService（UID 2000）から呼びます。端末や大型アップデートで内部APIが変わる可能性があるため、現時点では上記実機を対象とします。
+SIM切替はShizuku UserService（UID 2000）から `ISub` を呼びます。SM-S948Qを含め、メソッド名から実機のtransactionを動的解決し、解決できた役割だけを有効化します。SM-S948Qでは動的に得たデータ31・通話34・SMS37で実機動作を確認済みです。この端末に限り、動的検出自体が使えない場合の非常用フォールバックとして同じ固定値を保持します。内部APIを利用するため、すべてのOEMでの動作を保証するものではありません。
 
 ## ビルド
 
