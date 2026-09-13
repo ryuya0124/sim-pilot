@@ -22,6 +22,7 @@ import android.os.Build
 import android.os.Handler
 import android.os.IBinder
 import android.os.Looper
+import android.os.PowerManager
 import android.os.SystemClock
 import android.os.UserManager
 import android.provider.Settings
@@ -45,6 +46,7 @@ class MonitorService : Service() {
     private lateinit var switchAudit: SwitchAudit
     private lateinit var sims: SimRepository
     private lateinit var connectivity: ConnectivityManager
+    private lateinit var powerManager: PowerManager
     private lateinit var subscriptionManager: SubscriptionManager
     private var badSamples = 0
     private var sampleCount = 0
@@ -52,6 +54,7 @@ class MonitorService : Service() {
     private var subscriptionListenerRegistered = false
     private var settingsObserverRegistered = false
     private var unlockReceiverRegistered = false
+    private var screenReceiverRegistered = false
     private var shizukuListenersRegistered = false
     private var scheduledAtElapsed = Long.MAX_VALUE
     @Volatile private var backendInfo: SwitchBackendInfo? = null
@@ -99,6 +102,28 @@ class MonitorService : Service() {
             if (forceCheck) scheduleNext(0, forceDeepProbe = true)
         }
     }
+    private val screenReceiver = object : BroadcastReceiver() {
+        override fun onReceive(context: Context, intent: Intent?) {
+            when (intent?.action) {
+                Intent.ACTION_SCREEN_OFF -> {
+                    if (powerManager.isInteractive) return
+                    cancelScheduledCycle()
+                    forceDeepProbeRequested.set(false)
+                    rerunRequested.set(false)
+                    badSamples = 0
+                    sims.pause()
+                    AppState.update { it.copy(status = "スリープ中 · 監視を一時停止", badSamples = 0) }
+                    DiagnosticLog.info(this@MonitorService, "sleep_paused", "スリープ中は監視を一時停止")
+                }
+                Intent.ACTION_SCREEN_ON -> {
+                    if (!powerManager.isInteractive) return
+                    sims.resume()
+                    DiagnosticLog.info(this@MonitorService, "sleep_resumed", "画面復帰で監視を再開")
+                    scheduleNext(0)
+                }
+            }
+        }
+    }
     private val shizukuReceivedListener = Shizuku.OnBinderReceivedListener {
         backendInfo = null
         DiagnosticLog.info(this, "shizuku_available", "Shizukuが利用可能になりました")
@@ -129,10 +154,12 @@ class MonitorService : Service() {
         prefs = AppPreferences(this)
         switchAudit = SwitchAudit(this)
         connectivity = getSystemService(ConnectivityManager::class.java)
+        powerManager = getSystemService(PowerManager::class.java)
         subscriptionManager = getSystemService(SubscriptionManager::class.java)
         sims = SimRepository(this, mainExecutor) { event, subId ->
             requestRealtimeCheck(event, 300, mapOf("subId" to subId))
         }
+        if (!powerManager.isInteractive) sims.pause()
         runCatching { connectivity.registerDefaultNetworkCallback(networkCallback) }
             .onSuccess { networkCallbackRegistered = true }
             .onFailure { DiagnosticLog.warn(this, "network_callback_failed", "ネットワーク監視の登録に失敗", error = it) }
@@ -165,6 +192,16 @@ class MonitorService : Service() {
             ContextCompat.RECEIVER_EXPORTED,
         )
         unlockReceiverRegistered = true
+        ContextCompat.registerReceiver(
+            this,
+            screenReceiver,
+            IntentFilter().apply {
+                addAction(Intent.ACTION_SCREEN_OFF)
+                addAction(Intent.ACTION_SCREEN_ON)
+            },
+            ContextCompat.RECEIVER_EXPORTED,
+        )
+        screenReceiverRegistered = true
         runCatching {
             DEFAULT_SETTING_KEYS.forEach { key ->
                 contentResolver.registerContentObserver(Settings.Global.getUriFor(key), false, defaultSettingsObserver)
@@ -180,11 +217,14 @@ class MonitorService : Service() {
             "監視サービスを作成",
             mapOf(
                 "userUnlocked" to getSystemService(UserManager::class.java).isUserUnlocked,
+                "interactive" to powerManager.isInteractive,
                 "shizukuReady" to ShizukuBridge.isReady(),
                 "shizukuGranted" to ShizukuBridge.isGranted(),
             ),
         )
-        AppState.update { it.copy(monitorRunning = true, status = "モニターを準備中") }
+        AppState.update {
+            it.copy(monitorRunning = true, status = if (powerManager.isInteractive) "モニターを準備中" else "スリープ中 · 監視を一時停止")
+        }
     }
 
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
@@ -220,6 +260,7 @@ class MonitorService : Service() {
         }
         if (settingsObserverRegistered) runCatching { contentResolver.unregisterContentObserver(defaultSettingsObserver) }
         if (unlockReceiverRegistered) runCatching { unregisterReceiver(unlockReceiver) }
+        if (screenReceiverRegistered) runCatching { unregisterReceiver(screenReceiver) }
         runCatching { unregisterReceiver(defaultSubscriptionReceiver) }
         if (shizukuListenersRegistered) {
             runCatching { Shizuku.removeBinderReceivedListener(shizukuReceivedListener) }
@@ -239,6 +280,7 @@ class MonitorService : Service() {
         delayMs: Long,
         fields: Map<String, Any?> = emptyMap(),
     ) {
+        if (!powerManager.isInteractive) return
         DiagnosticLog.info(
             this,
             "realtime_trigger",
@@ -249,16 +291,25 @@ class MonitorService : Service() {
     }
 
     private fun scheduleNext(delayMs: Long, forceDeepProbe: Boolean = false) {
-        if (forceDeepProbe) forceDeepProbeRequested.set(true)
         val safeDelay = delayMs.coerceAtLeast(0L)
         mainHandler.post {
             if (stopped.get()) return@post
+            if (!powerManager.isInteractive) {
+                cancelScheduledCycle()
+                return@post
+            }
+            if (forceDeepProbe) forceDeepProbeRequested.set(true)
             val candidate = SystemClock.elapsedRealtime() + safeDelay
             if (!MonitorTiming.shouldReplace(scheduledAtElapsed, candidate)) return@post
             mainHandler.removeCallbacks(scheduledCycle)
             scheduledAtElapsed = candidate
             mainHandler.postDelayed(scheduledCycle, safeDelay)
         }
+    }
+
+    private fun cancelScheduledCycle() {
+        mainHandler.removeCallbacks(scheduledCycle)
+        scheduledAtElapsed = Long.MAX_VALUE
     }
 
     private fun enqueueCycle(forceDeepProbe: Boolean) {
@@ -303,6 +354,8 @@ class MonitorService : Service() {
             stopSelf()
             return
         }
+        if (!powerManager.isInteractive) return
+        sims.resume()
         val lines = sims.refresh()
         val userUnlocked = getSystemService(UserManager::class.java).isUserUnlocked
         if (userUnlocked) {
@@ -365,6 +418,7 @@ class MonitorService : Service() {
                 finishCycle("Wi-Fi接続中 · 通話終了後に既定SIMへ復帰", config)
                 return
             }
+            if (!powerManager.isInteractive) return
             val message = applyWifiPolicy(config, lines, backend)
             finishCycle(message, config)
             return
@@ -408,9 +462,17 @@ class MonitorService : Service() {
         val caps = cellularNetwork?.let(connectivity::getNetworkCapabilities)
         val validated = caps?.hasCapability(NetworkCapabilities.NET_CAPABILITY_VALIDATED) == true
         val latency = cellularNetwork?.let(::latencyProbe)
+        if (!powerManager.isInteractive) {
+            badSamples = 0
+            return
+        }
         sampleCount++
         val shouldMeasureSpeed = forceDeepProbe || latency == null || latency > config.latencyThresholdMs || sampleCount % 10 == 0
         val speed = if (shouldMeasureSpeed) cellularNetwork?.let(::speedProbe) else null
+        if (!powerManager.isInteractive) {
+            badSamples = 0
+            return
+        }
         Log.i(TAG, "probe subId=$dataSubId network=$cellularNetwork validated=$validated latencyMs=$latency speedKbps=$speed")
         val sample = QualitySample(
             inService = current.inService,
@@ -457,7 +519,7 @@ class MonitorService : Service() {
         val cooldownMs = config.cooldownMinutes * 60_000L
         val inCooldown = System.currentTimeMillis() - prefs.lastSwitchAt < cooldownMs
         val inCall = isInCall()
-        if (badSamples >= config.consecutiveFailures && alternate != null && !inCooldown && !inCall) {
+        if (badSamples >= config.consecutiveFailures && alternate != null && !inCooldown && !inCall && powerManager.isInteractive) {
             val requiredRoles = buildSet {
                 add(SimRole.DATA)
                 if (config.followVoice) add(SimRole.VOICE)
@@ -520,6 +582,7 @@ class MonitorService : Service() {
         val changed = mutableListOf<String>()
         val skipped = mutableListOf<String>()
         requested.forEach { (role, subId) ->
+            if (!powerManager.isInteractive) return "スリープ中 · Wi-Fi復帰を保留"
             if (!backend.supports(role)) {
                 skipped += "${role.label}未対応"
                 return@forEach
@@ -596,7 +659,7 @@ class MonitorService : Service() {
                 badSamples = badSamples,
             )
         }
-        if (config.needsService() && !stopped.get()) scheduleNext(nextCheckMs)
+        if (config.needsService() && !stopped.get() && powerManager.isInteractive) scheduleNext(nextCheckMs)
     }
 
     private fun setDefaultWithAudit(

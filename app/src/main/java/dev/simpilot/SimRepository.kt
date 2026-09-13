@@ -14,6 +14,7 @@ import android.telephony.TelephonyManager
 import androidx.core.content.ContextCompat
 import java.util.concurrent.ConcurrentHashMap
 import java.util.concurrent.Executor
+import java.util.concurrent.atomic.AtomicBoolean
 
 class SimRepository(
     private val context: Context,
@@ -24,6 +25,7 @@ class SimRepository(
     private val telephonyManager = context.getSystemService(TelephonyManager::class.java)
     private val callbacks = ConcurrentHashMap<Int, LineCallback>()
     private val observations = ConcurrentHashMap<Int, Observation>()
+    private val paused = AtomicBoolean(false)
 
     private data class Observation(
         val level: Int = -1,
@@ -106,7 +108,9 @@ class SimRepository(
         ContextCompat.checkSelfPermission(context, Manifest.permission.READ_PHONE_STATE) == PackageManager.PERMISSION_GRANTED
 
     @SuppressLint("MissingPermission")
+    @Synchronized
     fun refresh(): List<SimLine> {
+        if (paused.get()) return emptyList()
         if (!hasPhonePermission()) {
             AppState.update { it.copy(lines = emptyList(), status = "電話の権限が必要です") }
             return emptyList()
@@ -154,6 +158,18 @@ class SimRepository(
         return lines
     }
 
+    @Synchronized
+    fun pause() {
+        paused.set(true)
+        unregister()
+        observations.clear()
+    }
+
+    fun resume() {
+        paused.set(false)
+    }
+
+    @Synchronized
     fun unregister() {
         callbacks.forEach { (subId, callback) ->
             runCatching { telephonyManager.createForSubscriptionId(subId).unregisterTelephonyCallback(callback) }
@@ -161,7 +177,9 @@ class SimRepository(
         callbacks.clear()
     }
 
-    private fun publish() = refresh()
+    private fun publish() {
+        if (!paused.get()) refresh()
+    }
 
     private fun networkLabel(info: TelephonyDisplayInfo): String = when (info.overrideNetworkType) {
         TelephonyDisplayInfo.OVERRIDE_NETWORK_TYPE_NR_ADVANCED -> "5G+"
