@@ -43,7 +43,8 @@ data class MonitorConfig(
     val wifiSmsSubId: Int = -1,
     val intervalSeconds: Int = 30,
     val latencyThresholdMs: Int = 1200,
-    val speedThresholdKbps: Int = 512,
+    val speedThresholdKbps: Int = 5_000,
+    val weakSignalDbm: Int = -114,
     val consecutiveFailures: Int = 3,
     val cooldownMinutes: Int = 5,
 ) {
@@ -66,6 +67,7 @@ data class AppSnapshot(
     val lastSpeedKbps: Long? = null,
     val badSamples: Int = 0,
     val lastSwitchAt: Long? = null,
+    val dataUsage: Map<Int, DataUsageState> = emptyMap(),
 )
 
 object AppState {

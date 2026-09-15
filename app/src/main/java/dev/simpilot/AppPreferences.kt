@@ -1,6 +1,8 @@
 package dev.simpilot
 
 import android.content.Context
+import org.json.JSONArray
+import org.json.JSONObject
 
 class AppPreferences(context: Context) {
     private val storageContext = if (context.isDeviceProtectedStorage) {
@@ -12,7 +14,9 @@ class AppPreferences(context: Context) {
     }
     private val prefs = storageContext.getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE)
 
-    fun load(): MonitorConfig = MonitorConfig(
+    fun load(): MonitorConfig {
+        val qualityV2 = prefs.getBoolean("quality_v2", false)
+        return MonitorConfig(
         enabled = prefs.getBoolean("enabled", false),
         followVoice = prefs.getBoolean("follow_voice", false),
         followSms = prefs.getBoolean("follow_sms", false),
@@ -25,10 +29,12 @@ class AppPreferences(context: Context) {
         wifiSmsSubId = prefs.getInt("wifi_sms_sub_id", -1),
         intervalSeconds = prefs.getInt("interval", 30),
         latencyThresholdMs = prefs.getInt("latency", 1200),
-        speedThresholdKbps = prefs.getInt("speed", 512),
+        speedThresholdKbps = if (qualityV2) prefs.getInt("speed", 5_000) else 5_000,
+        weakSignalDbm = prefs.getInt("weak_signal_dbm", -114),
         consecutiveFailures = prefs.getInt("failures", 3),
         cooldownMinutes = prefs.getInt("cooldown", 5),
-    )
+        )
+    }
 
     fun save(config: MonitorConfig) {
         prefs.edit()
@@ -45,9 +51,78 @@ class AppPreferences(context: Context) {
             .putInt("interval", config.intervalSeconds)
             .putInt("latency", config.latencyThresholdMs)
             .putInt("speed", config.speedThresholdKbps)
+            .putInt("weak_signal_dbm", config.weakSignalDbm)
+            .putBoolean("quality_v2", true)
             .putInt("failures", config.consecutiveFailures)
             .putInt("cooldown", config.cooldownMinutes)
             .apply()
+    }
+
+    fun loadPlans(): List<SimPlanConfig> = runCatching {
+        val array = JSONArray(prefs.getString("data_plans", "[]") ?: "[]")
+        buildList {
+            for (index in 0 until array.length()) {
+                val item = array.getJSONObject(index)
+                val allowancesJson = item.optJSONArray("allowances") ?: JSONArray()
+                val allowances = buildList {
+                    for (allowanceIndex in 0 until allowancesJson.length()) {
+                        val allowance = allowancesJson.getJSONObject(allowanceIndex)
+                        add(
+                            DataAllowance(
+                                id = allowance.getLong("id"),
+                                name = allowance.optString("name", "データ容量"),
+                                capacityBytes = allowance.getLong("capacityBytes"),
+                                startEpochDay = allowance.getLong("startEpochDay"),
+                                endEpochDay = allowance.getLong("endEpochDay"),
+                            )
+                        )
+                    }
+                }
+                add(
+                    SimPlanConfig(
+                        subId = item.getInt("subId"),
+                        enabled = item.optBoolean("enabled", false),
+                        type = runCatching { DataPlanType.valueOf(item.optString("type")) }.getOrDefault(DataPlanType.MONTHLY),
+                        capacityBytes = item.optLong("capacityBytes", 20L * GB),
+                        billingDay = item.optInt("billingDay", 1),
+                        startEpochDay = item.optLong("startEpochDay", java.time.LocalDate.now().toEpochDay()),
+                        endEpochDay = item.optLong("endEpochDay", java.time.LocalDate.now().plusMonths(1).minusDays(1).toEpochDay()),
+                        allowances = allowances,
+                        manualRemainingBytes = if (item.has("manualRemainingBytes") && !item.isNull("manualRemainingBytes")) {
+                            item.getLong("manualRemainingBytes")
+                        } else null,
+                    )
+                )
+            }
+        }
+    }.getOrDefault(emptyList())
+
+    fun savePlans(plans: List<SimPlanConfig>) {
+        val array = JSONArray()
+        plans.forEach { plan ->
+            array.put(JSONObject().apply {
+                put("subId", plan.subId)
+                put("enabled", plan.enabled)
+                put("type", plan.type.name)
+                put("capacityBytes", plan.capacityBytes)
+                put("billingDay", plan.billingDay)
+                put("startEpochDay", plan.startEpochDay)
+                put("endEpochDay", plan.endEpochDay)
+                put("manualRemainingBytes", plan.manualRemainingBytes ?: JSONObject.NULL)
+                put("allowances", JSONArray().apply {
+                    plan.allowances.forEach { allowance ->
+                        put(JSONObject().apply {
+                            put("id", allowance.id)
+                            put("name", allowance.name)
+                            put("capacityBytes", allowance.capacityBytes)
+                            put("startEpochDay", allowance.startEpochDay)
+                            put("endEpochDay", allowance.endEpochDay)
+                        })
+                    }
+                })
+            })
+        }
+        prefs.edit().putString("data_plans", array.toString()).apply()
     }
 
     var lastSwitchAt: Long

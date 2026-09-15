@@ -12,7 +12,7 @@ internal object MonitorTiming {
         badSamples: Int,
         requiredBadSamples: Int,
     ): Long {
-        val degraded = enabled && badSamples > 0 && badSamples < requiredBadSamples.coerceAtLeast(1)
+        val degraded = enabled && badSamples > 0
         return if (degraded) minOf(configuredIntervalMs, DEGRADED_RECHECK_MS) else configuredIntervalMs
     }
 }

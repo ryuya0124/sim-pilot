@@ -30,9 +30,9 @@ class MonitorTimingTest {
     }
 
     @Test
-    fun normalAndFinalSamplesUseConfiguredInterval() {
+    fun normalSamplesUseConfiguredIntervalAndPersistentDegradationStaysRapid() {
         assertEquals(30_000, MonitorTiming.nextDelayMs(30_000, true, 0, 3))
-        assertEquals(30_000, MonitorTiming.nextDelayMs(30_000, true, 3, 3))
+        assertEquals(3_000, MonitorTiming.nextDelayMs(30_000, true, 3, 3))
         assertEquals(30_000, MonitorTiming.nextDelayMs(30_000, false, 1, 3))
     }
 }

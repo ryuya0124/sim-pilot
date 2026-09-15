@@ -42,6 +42,10 @@ import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.automirrored.rounded.Message
 import androidx.compose.material.icons.rounded.Bolt
+import androidx.compose.material.icons.rounded.Add
+import androidx.compose.material.icons.automirrored.rounded.ArrowBack
+import androidx.compose.material.icons.rounded.CalendarMonth
+import androidx.compose.material.icons.rounded.Delete
 import androidx.compose.material.icons.rounded.CellTower
 import androidx.compose.material.icons.rounded.DataUsage
 import androidx.compose.material.icons.rounded.Phone
@@ -55,6 +59,8 @@ import androidx.compose.material3.ButtonDefaults
 import androidx.compose.material3.Card
 import androidx.compose.material3.CardDefaults
 import androidx.compose.material3.ExperimentalMaterial3Api
+import androidx.compose.material3.DatePicker
+import androidx.compose.material3.DatePickerDialog
 import androidx.compose.material3.FilledTonalButton
 import androidx.compose.material3.FilterChip
 import androidx.compose.material3.HorizontalDivider
@@ -66,6 +72,8 @@ import androidx.compose.material3.Slider
 import androidx.compose.material3.Surface
 import androidx.compose.material3.Switch
 import androidx.compose.material3.Text
+import androidx.compose.material3.TextButton
+import androidx.compose.material3.rememberDatePickerState
 import androidx.compose.material3.darkColorScheme
 import androidx.compose.material3.dynamicDarkColorScheme
 import androidx.compose.material3.dynamicLightColorScheme
@@ -97,6 +105,7 @@ import kotlinx.coroutines.delay
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
 import rikka.shizuku.Shizuku
+import java.time.LocalDate
 
 class MainActivity : ComponentActivity() {
     private lateinit var repository: SimRepository
@@ -183,6 +192,7 @@ private fun SimPilotApp(repository: SimRepository) {
     val context = LocalContext.current
     var snapshot by remember { mutableStateOf(AppState.current()) }
     var config by remember { mutableStateOf(AppPreferences(context).load()) }
+    var plans by remember { mutableStateOf(AppPreferences(context).loadPlans()) }
     var showSettings by remember { mutableStateOf(false) }
     var busyRole by remember { mutableStateOf<SimRole?>(null) }
     val switchAudit = remember { SwitchAudit(context) }
@@ -260,11 +270,24 @@ private fun SimPilotApp(repository: SimRepository) {
                 "intervalSeconds" to next.intervalSeconds,
                 "latencyThresholdMs" to next.latencyThresholdMs,
                 "speedThresholdKbps" to next.speedThresholdKbps,
+                "weakSignalDbm" to next.weakSignalDbm,
                 "consecutiveFailures" to next.consecutiveFailures,
                 "cooldownMinutes" to next.cooldownMinutes,
             ),
         )
         if (next.needsService()) MonitorService.start(context, reason = "config_changed") else MonitorService.stop(context)
+    }
+
+    fun persistPlans(next: List<SimPlanConfig>) {
+        plans = next
+        AppPreferences(context).savePlans(next)
+        DiagnosticLog.info(
+            context,
+            "data_plans_changed",
+            "SIM別データプラン設定を変更",
+            mapOf("configuredSubIds" to next.filter { it.enabled }.joinToString(",") { it.subId.toString() }),
+        )
+        if (config.needsService()) MonitorService.start(context, reason = "data_plans_changed")
     }
 
     fun switch(role: SimRole, subId: Int) {
@@ -286,6 +309,7 @@ private fun SimPilotApp(repository: SimRepository) {
                 }
             }
             if (result.isSuccess) {
+                if (role == SimRole.DATA) AppPreferences(context).lastSwitchAt = System.currentTimeMillis()
                 AppState.update { it.copy(status = "${role.label}を切り替えました") }
                 delay(700)
                 val refreshed = repository.refresh()
@@ -372,7 +396,7 @@ private fun SimPilotApp(repository: SimRepository) {
                     }
                 }
                 item { QualityCard(snapshot) }
-                item { SimDetails(snapshot.lines, snapshot.dataSubId) }
+                item { SimDetails(snapshot.lines, snapshot.dataSubId, snapshot.dataUsage) }
                 item {
                     FilledTonalButton(
                         onClick = {
@@ -395,8 +419,10 @@ private fun SimPilotApp(repository: SimRepository) {
             dataSubId = snapshot.dataSubId,
             voiceSubId = snapshot.voiceSubId,
             smsSubId = snapshot.smsSubId,
+            plans = plans,
             onDismiss = { showSettings = false },
             onChange = ::persist,
+            onPlansChange = ::persistPlans,
         )
     }
 }
@@ -596,7 +622,7 @@ private fun Metric(label: String, value: String, modifier: Modifier) {
 }
 
 @Composable
-private fun SimDetails(lines: List<SimLine>, dataSubId: Int) {
+private fun SimDetails(lines: List<SimLine>, dataSubId: Int, dataUsage: Map<Int, DataUsageState>) {
     Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
         Text("回線状態", style = MaterialTheme.typography.titleLarge, fontWeight = FontWeight.Bold)
         if (lines.isEmpty()) {
@@ -617,7 +643,17 @@ private fun SimDetails(lines: List<SimLine>, dataSubId: Int) {
                     Spacer(Modifier.width(12.dp))
                     Column(Modifier.weight(1f)) {
                         Text(line.title, fontWeight = FontWeight.Bold)
-                        Text(line.subtitle, style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.onSurfaceVariant)
+                        val usage = dataUsage[line.subId]
+                        Text(
+                            buildString {
+                                append(line.subtitle)
+                                usage?.let {
+                                    append(if (it.available) " · 残り ${formatGb(it.remainingBytes)} / ${formatGb(it.capacityBytes)} GB" else " · 通信量取得待ち")
+                                }
+                            },
+                            style = MaterialTheme.typography.bodySmall,
+                            color = MaterialTheme.colorScheme.onSurfaceVariant,
+                        )
                     }
                     Column(horizontalAlignment = Alignment.End) {
                         Text(line.networkType, fontWeight = FontWeight.Bold)
@@ -639,119 +675,315 @@ private fun SettingsSheet(
     dataSubId: Int,
     voiceSubId: Int,
     smsSubId: Int,
+    plans: List<SimPlanConfig>,
     onDismiss: () -> Unit,
     onChange: (MonitorConfig) -> Unit,
+    onPlansChange: (List<SimPlanConfig>) -> Unit,
 ) {
+    var page by remember { mutableStateOf(SettingsPage.HOME) }
     ModalBottomSheet(onDismissRequest = onDismiss) {
         LazyColumn(
             contentPadding = PaddingValues(start = 22.dp, end = 22.dp, bottom = 32.dp),
             verticalArrangement = Arrangement.spacedBy(18.dp),
         ) {
-            item {
-                Text("Wi-Fi接続時", style = MaterialTheme.typography.headlineSmall, fontWeight = FontWeight.Bold)
-            }
-            item {
-                Surface(shape = RoundedCornerShape(22.dp), color = MaterialTheme.colorScheme.surfaceContainerHigh) {
-                    Column(Modifier.padding(16.dp), verticalArrangement = Arrangement.spacedBy(14.dp)) {
-                        Row(verticalAlignment = Alignment.CenterVertically) {
-                            Icon(Icons.Rounded.Wifi, null)
-                            Spacer(Modifier.width(10.dp))
-                            Column(Modifier.weight(1f)) {
-                                Text("指定した既定SIMへ戻す", fontWeight = FontWeight.Bold)
-                                Text("モバイル通信の自動切替は常に停止します", style = MaterialTheme.typography.bodySmall)
-                            }
-                            Switch(
-                                checked = config.wifiRestoreEnabled,
-                                onCheckedChange = { onChange(config.copy(wifiRestoreEnabled = it)) },
-                            )
+            when (page) {
+                SettingsPage.HOME -> {
+                    item { Text("設定", style = MaterialTheme.typography.headlineMedium, fontWeight = FontWeight.Bold) }
+                    item {
+                        SettingsCategory(Icons.Rounded.CellTower, "通信品質", "電波・速度・遅延・切替感度") {
+                            page = SettingsPage.QUALITY
                         }
-                        AnimatedVisibility(config.wifiRestoreEnabled) {
-                            Column(verticalArrangement = Arrangement.spacedBy(14.dp)) {
-                                FilledTonalButton(
-                                    onClick = {
-                                        onChange(
-                                            config.copy(
-                                                wifiDataSubId = dataSubId,
-                                                wifiVoiceSubId = voiceSubId,
-                                                wifiSmsSubId = smsSubId,
-                                            )
-                                        )
-                                    },
-                                    enabled = lines.isNotEmpty(),
-                                    modifier = Modifier.fillMaxWidth(),
-                                ) {
-                                    Text("現在の既定SIMを復帰先にセット")
+                    }
+                    item {
+                        SettingsCategory(Icons.Rounded.Wifi, "Wi-Fi接続時", "切替停止と既定SIMへの復帰") {
+                            page = SettingsPage.WIFI
+                        }
+                    }
+                    item {
+                        SettingsCategory(Icons.Rounded.DataUsage, "データプラン", "SIM別容量・期間・povoトッピング") {
+                            page = SettingsPage.DATA_PLANS
+                        }
+                    }
+                }
+                SettingsPage.WIFI -> {
+                    item { SettingsPageHeader("Wi-Fi接続時") { page = SettingsPage.HOME } }
+                    item {
+                        Surface(shape = RoundedCornerShape(22.dp), color = MaterialTheme.colorScheme.surfaceContainerHigh) {
+                            Column(Modifier.padding(16.dp), verticalArrangement = Arrangement.spacedBy(14.dp)) {
+                                Row(verticalAlignment = Alignment.CenterVertically) {
+                                    Icon(Icons.Rounded.Wifi, null)
+                                    Spacer(Modifier.width(10.dp))
+                                    Column(Modifier.weight(1f)) {
+                                        Text("指定した既定SIMへ戻す", fontWeight = FontWeight.Bold)
+                                        Text("モバイル通信の自動切替は常に停止します", style = MaterialTheme.typography.bodySmall)
+                                    }
+                                    Switch(config.wifiRestoreEnabled, { onChange(config.copy(wifiRestoreEnabled = it)) })
                                 }
-                                WifiRoleSetting(
-                                    role = SimRole.DATA,
-                                    enabled = config.wifiDataEnabled,
-                                    selectedSubId = config.wifiDataSubId,
-                                    lines = lines,
-                                    onEnabled = { onChange(config.copy(wifiDataEnabled = it)) },
-                                    onSelected = { onChange(config.copy(wifiDataSubId = it)) },
-                                )
-                                WifiRoleSetting(
-                                    role = SimRole.VOICE,
-                                    enabled = config.wifiVoiceEnabled,
-                                    selectedSubId = config.wifiVoiceSubId,
-                                    lines = lines,
-                                    onEnabled = { onChange(config.copy(wifiVoiceEnabled = it)) },
-                                    onSelected = { onChange(config.copy(wifiVoiceSubId = it)) },
-                                )
-                                WifiRoleSetting(
-                                    role = SimRole.SMS,
-                                    enabled = config.wifiSmsEnabled,
-                                    selectedSubId = config.wifiSmsSubId,
-                                    lines = lines,
-                                    onEnabled = { onChange(config.copy(wifiSmsEnabled = it)) },
-                                    onSelected = { onChange(config.copy(wifiSmsSubId = it)) },
-                                )
+                                AnimatedVisibility(config.wifiRestoreEnabled) {
+                                    Column(verticalArrangement = Arrangement.spacedBy(14.dp)) {
+                                        FilledTonalButton(
+                                            onClick = {
+                                                onChange(config.copy(wifiDataSubId = dataSubId, wifiVoiceSubId = voiceSubId, wifiSmsSubId = smsSubId))
+                                            },
+                                            enabled = lines.isNotEmpty(),
+                                            modifier = Modifier.fillMaxWidth(),
+                                        ) { Text("現在の既定SIMを復帰先にセット") }
+                                        WifiRoleSetting(SimRole.DATA, config.wifiDataEnabled, config.wifiDataSubId, lines, { onChange(config.copy(wifiDataEnabled = it)) }, { onChange(config.copy(wifiDataSubId = it)) })
+                                        WifiRoleSetting(SimRole.VOICE, config.wifiVoiceEnabled, config.wifiVoiceSubId, lines, { onChange(config.copy(wifiVoiceEnabled = it)) }, { onChange(config.copy(wifiVoiceSubId = it)) })
+                                        WifiRoleSetting(SimRole.SMS, config.wifiSmsEnabled, config.wifiSmsSubId, lines, { onChange(config.copy(wifiSmsEnabled = it)) }, { onChange(config.copy(wifiSmsSubId = it)) })
+                                    }
+                                }
                             }
                         }
                     }
                 }
-            }
-            item {
-                Text("自動切替の判定", style = MaterialTheme.typography.headlineSmall, fontWeight = FontWeight.Bold)
-            }
-            item {
-                SettingSlider("監視間隔", "${config.intervalSeconds} 秒", config.intervalSeconds.toFloat(), 15f..120f, 7) {
-                    onChange(config.copy(intervalSeconds = it.toInt()))
+                SettingsPage.QUALITY -> {
+                    item { SettingsPageHeader("通信品質") { page = SettingsPage.HOME } }
+                    item { SettingSlider("監視間隔", "${config.intervalSeconds} 秒", config.intervalSeconds.toFloat(), 15f..120f, 7) { onChange(config.copy(intervalSeconds = it.toInt())) } }
+                    item { SettingSlider("遅延しきい値", "${config.latencyThresholdMs} ms", config.latencyThresholdMs.toFloat(), 300f..3000f, 8) { onChange(config.copy(latencyThresholdMs = (it / 100).toInt() * 100)) } }
+                    item { SettingSlider("目標速度", "${config.speedThresholdKbps / 1000f} Mbps", config.speedThresholdKbps.toFloat(), 500f..20000f, 38) { onChange(config.copy(speedThresholdKbps = (it / 500).toInt() * 500)) } }
+                    item { SettingSlider("弱電波の基準", "${config.weakSignalDbm} dBm", config.weakSignalDbm.toFloat(), -125f..-95f, 29) { onChange(config.copy(weakSignalDbm = it.toInt())) } }
+                    item { SettingSlider("連続低品質", "${config.consecutiveFailures} 回", config.consecutiveFailures.toFloat(), 2f..5f, 2) { onChange(config.copy(consecutiveFailures = it.toInt())) } }
+                    item { SettingSlider("切替後クールダウン", "${config.cooldownMinutes} 分", config.cooldownMinutes.toFloat(), 1f..30f, 28) { onChange(config.copy(cooldownMinutes = it.toInt())) } }
+                    item {
+                        Surface(shape = RoundedCornerShape(16.dp), color = MaterialTheme.colorScheme.surfaceContainerHigh) {
+                            Text(
+                                "電波・遅延・実効速度を合算し、弱電波時は3秒間隔で再確認します。短い疎通成功1回だけでは悪化履歴を消しません。",
+                                Modifier.padding(14.dp),
+                                style = MaterialTheme.typography.bodySmall,
+                                color = MaterialTheme.colorScheme.onSurfaceVariant,
+                            )
+                        }
+                    }
                 }
-            }
-            item {
-                SettingSlider("遅延しきい値", "${config.latencyThresholdMs} ms", config.latencyThresholdMs.toFloat(), 300f..3000f, 8) {
-                    onChange(config.copy(latencyThresholdMs = (it / 100).toInt() * 100))
-                }
-            }
-            item {
-                SettingSlider("最低速度", "${config.speedThresholdKbps} kbps", config.speedThresholdKbps.toFloat(), 128f..2048f, 7) {
-                    onChange(config.copy(speedThresholdKbps = (it / 128).toInt() * 128))
-                }
-            }
-            item {
-                SettingSlider("連続低品質", "${config.consecutiveFailures} 回", config.consecutiveFailures.toFloat(), 2f..5f, 2) {
-                    onChange(config.copy(consecutiveFailures = it.toInt()))
-                }
-            }
-            item {
-                SettingSlider("切替後クールダウン", "${config.cooldownMinutes} 分", config.cooldownMinutes.toFloat(), 1f..30f, 28) {
-                    onChange(config.copy(cooldownMinutes = it.toInt()))
-                }
-            }
-            item {
-                Surface(shape = RoundedCornerShape(16.dp), color = MaterialTheme.colorScheme.surfaceContainerHigh) {
-                    Text(
-                        "SIMの有無と表示名は端末から自動取得します。Wi-Fi復帰先が抜かれている場合、その項目だけ安全に保留します。通常は小さな疎通確認のみで、約5分ごと、または遅延悪化時に64KBの速度テストを行います。",
-                        modifier = Modifier.padding(14.dp),
-                        style = MaterialTheme.typography.bodySmall,
-                        color = MaterialTheme.colorScheme.onSurfaceVariant,
-                    )
+                SettingsPage.DATA_PLANS -> {
+                    item { SettingsPageHeader("データプラン") { page = SettingsPage.HOME } }
+                    item { DataPlanSettings(lines = lines, plans = plans, onPlansChange = onPlansChange) }
                 }
             }
         }
     }
 }
+
+private enum class SettingsPage { HOME, WIFI, QUALITY, DATA_PLANS }
+
+@Composable
+private fun SettingsPageHeader(title: String, onBack: () -> Unit) {
+    Row(verticalAlignment = Alignment.CenterVertically) {
+        IconButton(onClick = onBack) { Icon(Icons.AutoMirrored.Rounded.ArrowBack, "設定へ戻る") }
+        Spacer(Modifier.width(6.dp))
+        Text(title, style = MaterialTheme.typography.headlineSmall, fontWeight = FontWeight.Bold)
+    }
+}
+
+@Composable
+private fun SettingsCategory(icon: ImageVector, title: String, subtitle: String, onClick: () -> Unit) {
+    FilledTonalButton(onClick = onClick, modifier = Modifier.fillMaxWidth(), contentPadding = PaddingValues(18.dp)) {
+        Icon(icon, null, Modifier.size(26.dp))
+        Spacer(Modifier.width(14.dp))
+        Column(Modifier.weight(1f), horizontalAlignment = Alignment.Start) {
+            Text(title, fontWeight = FontWeight.Bold, style = MaterialTheme.typography.titleMedium)
+            Text(subtitle, style = MaterialTheme.typography.bodySmall)
+        }
+    }
+}
+
+@Composable
+private fun DataPlanSettings(
+    lines: List<SimLine>,
+    plans: List<SimPlanConfig>,
+    onPlansChange: (List<SimPlanConfig>) -> Unit,
+) {
+    fun update(plan: SimPlanConfig) {
+        onPlansChange(plans.filterNot { it.subId == plan.subId } + plan)
+    }
+
+    Column(verticalArrangement = Arrangement.spacedBy(12.dp)) {
+        if (lines.isEmpty()) {
+            Text("有効なSIMを検出すると設定できます", color = MaterialTheme.colorScheme.onSurfaceVariant)
+        }
+        lines.forEach { line ->
+            val plan = plans.firstOrNull { it.subId == line.subId } ?: SimPlanConfig(subId = line.subId)
+            Surface(shape = RoundedCornerShape(22.dp), color = MaterialTheme.colorScheme.surfaceContainerHigh) {
+                Column(Modifier.padding(16.dp), verticalArrangement = Arrangement.spacedBy(12.dp)) {
+                    Row(verticalAlignment = Alignment.CenterVertically) {
+                        Column(Modifier.weight(1f)) {
+                            Text(line.title, fontWeight = FontWeight.Bold)
+                            Text("残量を切替判断に使う", style = MaterialTheme.typography.bodySmall)
+                        }
+                        Switch(plan.enabled, { update(plan.copy(enabled = it)) })
+                    }
+                    AnimatedVisibility(plan.enabled) {
+                        Column(verticalArrangement = Arrangement.spacedBy(12.dp)) {
+                            FlowRow(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                                DataPlanType.entries.forEach { type ->
+                                    FilterChip(
+                                        selected = plan.type == type,
+                                        onClick = { update(plan.copy(type = type, manualRemainingBytes = null)) },
+                                        label = { Text(type.label) },
+                                    )
+                                }
+                            }
+                            when (plan.type) {
+                                DataPlanType.MONTHLY -> {
+                                    CapacitySlider("月間容量", plan.capacityBytes, 200) {
+                                        update(plan.copy(capacityBytes = it, manualRemainingBytes = null))
+                                    }
+                                    SettingSlider(
+                                        "開始日",
+                                        "毎月 ${plan.billingDay} 日開始",
+                                        plan.billingDay.toFloat(),
+                                        1f..31f,
+                                        29,
+                                    ) { update(plan.copy(billingDay = it.toInt())) }
+                                }
+                                DataPlanType.FIXED -> {
+                                    CapacitySlider("容量", plan.capacityBytes, 300) {
+                                        update(plan.copy(capacityBytes = it, manualRemainingBytes = null))
+                                    }
+                                    Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                                        PlanDateButton("開始", plan.startEpochDay, Modifier.weight(1f)) {
+                                            update(plan.copy(startEpochDay = it.coerceAtMost(plan.endEpochDay)))
+                                        }
+                                        PlanDateButton("終了", plan.endEpochDay, Modifier.weight(1f)) {
+                                            update(plan.copy(endEpochDay = it.coerceAtLeast(plan.startEpochDay)))
+                                        }
+                                    }
+                                }
+                                DataPlanType.FLEXIBLE -> {
+                                    plan.allowances.forEachIndexed { index, allowance ->
+                                        FlexibleAllowanceEditor(
+                                            allowance = allowance,
+                                            index = index,
+                                            onChange = { changed ->
+                                                update(plan.copy(allowances = plan.allowances.map { if (it.id == changed.id) changed else it }, manualRemainingBytes = null))
+                                            },
+                                            onDelete = {
+                                                update(plan.copy(allowances = plan.allowances.filterNot { it.id == allowance.id }, manualRemainingBytes = null))
+                                            },
+                                        )
+                                    }
+                                    FilledTonalButton(
+                                        onClick = {
+                                            val today = LocalDate.now()
+                                            val next = DataAllowance(
+                                                id = System.currentTimeMillis(),
+                                                name = "トッピング ${plan.allowances.size + 1}",
+                                                capacityBytes = 3L * GB,
+                                                startEpochDay = today.toEpochDay(),
+                                                endEpochDay = today.plusDays(30).toEpochDay(),
+                                            )
+                                            update(plan.copy(allowances = plan.allowances + next))
+                                        },
+                                        modifier = Modifier.fillMaxWidth(),
+                                    ) {
+                                        Icon(Icons.Rounded.Add, null)
+                                        Spacer(Modifier.width(8.dp))
+                                        Text("データトッピングを追加")
+                                    }
+                                    if (plan.allowances.isEmpty()) {
+                                        Text("有効期間と容量を持つトッピングを追加してください", style = MaterialTheme.typography.bodySmall)
+                                    }
+                                }
+                            }
+
+                            val totalCapacity = when (plan.type) {
+                                DataPlanType.FLEXIBLE -> plan.allowances.sumOf { it.capacityBytes }
+                                else -> plan.capacityBytes
+                            }
+                            if (totalCapacity > 0) {
+                                Row(verticalAlignment = Alignment.CenterVertically) {
+                                    Column(Modifier.weight(1f)) {
+                                        Text("残量を手動指定", fontWeight = FontWeight.Medium)
+                                        Text("事業者アプリの表示を優先", style = MaterialTheme.typography.bodySmall)
+                                    }
+                                    Switch(
+                                        checked = plan.manualRemainingBytes != null,
+                                        onCheckedChange = {
+                                            update(plan.copy(manualRemainingBytes = if (it) totalCapacity else null))
+                                        },
+                                    )
+                                }
+                                AnimatedVisibility(plan.manualRemainingBytes != null) {
+                                    CapacitySlider("現在の残量", plan.manualRemainingBytes ?: totalCapacity, (totalCapacity / GB).coerceAtLeast(1).toInt()) {
+                                        update(plan.copy(manualRemainingBytes = it.coerceAtMost(totalCapacity)))
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        Text(
+            "通信不能・圏外からの復旧を最優先します。両回線が良好な場合だけ、残量率が15ポイント以上かつ500MB以上多い回線を優先します。",
+            style = MaterialTheme.typography.bodySmall,
+            color = MaterialTheme.colorScheme.onSurfaceVariant,
+        )
+    }
+}
+
+@Composable
+private fun FlexibleAllowanceEditor(
+    allowance: DataAllowance,
+    index: Int,
+    onChange: (DataAllowance) -> Unit,
+    onDelete: () -> Unit,
+) {
+    Surface(shape = RoundedCornerShape(16.dp), color = MaterialTheme.colorScheme.surfaceContainerLowest) {
+        Column(Modifier.padding(12.dp), verticalArrangement = Arrangement.spacedBy(8.dp)) {
+            Row(verticalAlignment = Alignment.CenterVertically) {
+                Text(allowance.name.ifBlank { "トッピング ${index + 1}" }, Modifier.weight(1f), fontWeight = FontWeight.Bold)
+                IconButton(onClick = onDelete) { Icon(Icons.Rounded.Delete, "削除") }
+            }
+            CapacitySlider("容量", allowance.capacityBytes, 300) {
+                onChange(allowance.copy(capacityBytes = it))
+            }
+            Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                PlanDateButton("開始", allowance.startEpochDay, Modifier.weight(1f)) {
+                    onChange(allowance.copy(startEpochDay = it.coerceAtMost(allowance.endEpochDay)))
+                }
+                PlanDateButton("終了", allowance.endEpochDay, Modifier.weight(1f)) {
+                    onChange(allowance.copy(endEpochDay = it.coerceAtLeast(allowance.startEpochDay)))
+                }
+            }
+        }
+    }
+}
+
+@Composable
+private fun CapacitySlider(label: String, bytes: Long, maxGb: Int, onValue: (Long) -> Unit) {
+    val valueGb = bytes.toFloat() / GB
+    SettingSlider(label, "${formatGb(bytes)} GB", valueGb, 0f..maxGb.toFloat(), maxGb * 2 - 1) {
+        onValue(((it * 2).toInt() / 2f * GB).toLong())
+    }
+}
+
+@OptIn(ExperimentalMaterial3Api::class)
+@Composable
+private fun PlanDateButton(label: String, epochDay: Long, modifier: Modifier = Modifier, onDate: (Long) -> Unit) {
+    var open by remember { mutableStateOf(false) }
+    FilledTonalButton(onClick = { open = true }, modifier = modifier) {
+        Icon(Icons.Rounded.CalendarMonth, null, Modifier.size(18.dp))
+        Spacer(Modifier.width(6.dp))
+        Text("$label ${LocalDate.ofEpochDay(epochDay)}")
+    }
+    if (open) {
+        val state = rememberDatePickerState(initialSelectedDateMillis = epochDay * 86_400_000L)
+        DatePickerDialog(
+            onDismissRequest = { open = false },
+            confirmButton = {
+                TextButton(onClick = {
+                    state.selectedDateMillis?.let { onDate(it / 86_400_000L) }
+                    open = false
+                }) { Text("決定") }
+            },
+            dismissButton = { TextButton(onClick = { open = false }) { Text("キャンセル") } },
+        ) { DatePicker(state = state) }
+    }
+}
+
+private fun formatGb(bytes: Long): String = String.format(java.util.Locale.JAPAN, "%.1f", bytes.toDouble() / GB)
 
 @Composable
 private fun WifiRoleSetting(

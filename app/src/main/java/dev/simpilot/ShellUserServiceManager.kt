@@ -15,8 +15,8 @@ object ShellUserServiceManager {
     private val args by lazy {
         Shizuku.UserServiceArgs(ComponentName(BuildConfig.APPLICATION_ID, ShellUserService::class.java.name))
             .processNameSuffix("sim_shell")
-            .tag("sim-pilot-shell-v2")
-            .version(2)
+            .tag("sim-pilot-shell-v6")
+            .version(6)
             .daemon(false)
             .debuggable(BuildConfig.DEBUG)
     }

@@ -48,6 +48,14 @@ object ShizukuBridge {
         }
     }
 
+    fun mobileUsageBytes(subId: Int, startTime: Long, endTime: Long): Result<Long> = runCatching {
+        check(isReady()) { "Shizukuが起動していません" }
+        check(isGranted()) { "Shizuku権限がありません" }
+        val json = JSONObject(ShellUserServiceManager.requireService().mobileUsage(subId, startTime, endTime))
+        check(!json.has("error")) { json.optString("error", "通信量を取得できません") }
+        json.getLong("totalBytes")
+    }
+
     private const val VERIFY_TIMEOUT_MS = 6_000L
     private const val VERIFY_INTERVAL_MS = 200L
 }
