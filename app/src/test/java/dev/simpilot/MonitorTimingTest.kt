@@ -35,4 +35,10 @@ class MonitorTimingTest {
         assertEquals(3_000, MonitorTiming.nextDelayMs(30_000, true, 3, 3))
         assertEquals(30_000, MonitorTiming.nextDelayMs(30_000, false, 1, 3))
     }
+
+    @Test
+    fun qualityRecoveryAllowsSlowCellularRegistrationButQuotaTrialStaysShort() {
+        assertEquals(30_000, MonitorTiming.comparisonSettleTimeoutMs(qualityRecovery = true))
+        assertEquals(7_000, MonitorTiming.comparisonSettleTimeoutMs(qualityRecovery = false))
+    }
 }

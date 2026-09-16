@@ -40,11 +40,13 @@ import java.util.concurrent.CountDownLatch
 import java.util.concurrent.ConcurrentHashMap
 import java.util.concurrent.TimeUnit
 import java.util.concurrent.atomic.AtomicBoolean
+import java.util.concurrent.atomic.AtomicReference
 import kotlin.math.roundToLong
 import rikka.shizuku.Shizuku
 
 class MonitorService : Service() {
     private val worker = Executors.newSingleThreadExecutor()
+    private val usageWorker = Executors.newSingleThreadExecutor()
     private val mainHandler = Handler(Looper.getMainLooper())
     private lateinit var prefs: AppPreferences
     private lateinit var switchAudit: SwitchAudit
@@ -53,9 +55,11 @@ class MonitorService : Service() {
     private lateinit var powerManager: PowerManager
     private lateinit var subscriptionManager: SubscriptionManager
     private var badSamples = 0
-    private var sampleCount = 0
+    private var latencyEndpointIndex = 0
+    private var lastSpeedProbeAtElapsed = 0L
+    private var lastPeriodicAlternateProbeAtElapsed = 0L
     private val alternateProbeCache = mutableMapOf<Int, TimedQualitySample>()
-    private val usageCache = mutableMapOf<Int, TimedUsage>()
+    private val usageCache = ConcurrentHashMap<Int, TimedUsage>()
     private val lastComparisonTrialAt = mutableMapOf<Int, Long>()
     private var directAlternateRequestSupported: Boolean? = null
     private var boundNetworkProbeSupported: Boolean? = null
@@ -73,6 +77,9 @@ class MonitorService : Service() {
     private val cycleInFlight = AtomicBoolean(false)
     private val rerunRequested = AtomicBoolean(false)
     private val forceDeepProbeRequested = AtomicBoolean(false)
+    private val usageRefreshInFlight = AtomicBoolean(false)
+    private val activeProbeConnection = AtomicReference<HttpURLConnection?>(null)
+    @Volatile private var lastWakeAtElapsed: Long? = null
     private val scheduledCycle = Runnable {
         scheduledAtElapsed = Long.MAX_VALUE
         if (!stopped.get()) enqueueCycle(forceDeepProbe = false)
@@ -135,6 +142,7 @@ class MonitorService : Service() {
                 Intent.ACTION_SCREEN_OFF -> {
                     if (powerManager.isInteractive) return
                     cancelScheduledCycle()
+                    activeProbeConnection.getAndSet(null)?.disconnect()
                     forceDeepProbeRequested.set(false)
                     rerunRequested.set(false)
                     badSamples = 0
@@ -144,6 +152,7 @@ class MonitorService : Service() {
                 }
                 Intent.ACTION_SCREEN_ON -> {
                     if (!powerManager.isInteractive) return
+                    lastWakeAtElapsed = SystemClock.elapsedRealtime()
                     sims.resume()
                     DiagnosticLog.info(this@MonitorService, "sleep_resumed", "画面復帰で監視を再開")
                     scheduleNext(0)
@@ -309,6 +318,7 @@ class MonitorService : Service() {
         }
         sims.unregister()
         worker.shutdownNow()
+        usageWorker.shutdownNow()
         DiagnosticLog.info(this, "service_destroyed", "監視サービスを終了")
         AppState.update { it.copy(monitorRunning = false, status = "停止中") }
         super.onDestroy()
@@ -390,6 +400,9 @@ class MonitorService : Service() {
     }
 
     private fun runCycle(forceDeepProbe: Boolean) {
+        val cycleStartedAtElapsed = SystemClock.elapsedRealtime()
+        val wakeStartedAtElapsed = lastWakeAtElapsed
+        val wakeToCycleStartMs = wakeStartedAtElapsed?.let { (cycleStartedAtElapsed - it).coerceAtLeast(0L) }
         val config = prefs.load()
         if (!config.needsService() && !forceDeepProbe) {
             stopSelf()
@@ -509,17 +522,51 @@ class MonitorService : Service() {
             finishCycle("${current.title} · 回線切替の反映待ち", config)
             return
         }
+        if (wakeStartedAtElapsed != null) {
+            val radio = current.dbm?.let { "$it dBm" } ?: if (current.signalLevel >= 0) "電波 ${current.signalLevel}/4" else "電波取得中"
+            AppState.update {
+                it.copy(
+                    status = "復帰直後チェック · ${current.title} · $radio",
+                    lastLatencyMs = null,
+                    lastSpeedKbps = null,
+                )
+            }
+            DiagnosticLog.info(
+                this,
+                "wake_precheck",
+                "画面復帰後の電波と疎通を即時確認",
+                mapOf(
+                    "subId" to current.subId,
+                    "name" to current.title,
+                    "dbm" to current.dbm,
+                    "signalLevel" to current.signalLevel,
+                    "validated" to validated,
+                    "wakeToPrecheckMs" to (SystemClock.elapsedRealtime() - wakeStartedAtElapsed),
+                ),
+            )
+        }
+        val latencyProbeStarted = SystemClock.elapsedRealtime()
         val latency = cellularNetwork?.let { latencyProbe(it, allowDefaultFallback = true) }
+        val latencyProbeElapsedMs = SystemClock.elapsedRealtime() - latencyProbeStarted
         if (!powerManager.isInteractive) {
             badSamples = 0
             return
         }
-        sampleCount++
         val weakSignal = current.dbm?.let { it <= config.weakSignalDbm }
             ?: (current.signalLevel in 0..1)
-        val shouldMeasureSpeed = forceDeepProbe || weakSignal || latency == null ||
-            latency > config.latencyThresholdMs * 2L / 3L || sampleCount % 10 == 0
-        val speed = if (shouldMeasureSpeed) cellularNetwork?.let { speedProbe(it, allowDefaultFallback = true) } else null
+        val nowElapsed = SystemClock.elapsedRealtime()
+        val rapidSpeedDue = nowElapsed - lastSpeedProbeAtElapsed >= RAPID_SPEED_MIN_GAP_MS
+        val periodicSpeedDue = nowElapsed - lastSpeedProbeAtElapsed >=
+            maxOf(config.intervalSeconds * 10_000L, MIN_PERIODIC_SPEED_INTERVAL_MS)
+        val shouldMeasureSpeed = forceDeepProbe ||
+            (rapidSpeedDue && (weakSignal || latency == null || latency > config.latencyThresholdMs * 2L / 3L)) ||
+            periodicSpeedDue
+        val speedProbeStarted = SystemClock.elapsedRealtime()
+        val speed = if (shouldMeasureSpeed) {
+            lastSpeedProbeAtElapsed = nowElapsed
+            cellularNetwork?.let { speedProbe(it, allowDefaultFallback = true) }
+        } else null
+        val speedProbeElapsedMs = if (shouldMeasureSpeed) SystemClock.elapsedRealtime() - speedProbeStarted else 0L
         if (!powerManager.isInteractive) {
             badSamples = 0
             return
@@ -544,17 +591,74 @@ class MonitorService : Service() {
             QualityVerdict.INCONCLUSIVE -> badSamples
         }
 
+        val primaryStatus = buildString {
+            append(current.title)
+            append(" · ")
+            append(latency?.let { "${it}ms" } ?: if (validated) "疎通確認済み" else "通信未検証")
+            speed?.let { append(" · ${it}kbps") }
+            append(" · score ${assessment.score}")
+            if (assessment.needsRapidRecheck) append(" · 切替先を確認中")
+        }
+        AppState.update {
+            it.copy(
+                status = primaryStatus,
+                lastLatencyMs = latency,
+                lastSpeedKbps = speed,
+                badSamples = badSamples,
+            )
+        }
+        DiagnosticLog.info(
+            this,
+            "primary_quality_result",
+            "現在のデータSIMを先行判定",
+            mapOf(
+                "subId" to dataSubId,
+                "name" to current.title,
+                "dbm" to current.dbm,
+                "validated" to validated,
+                "latencyMs" to latency,
+                "speedKbps" to speed,
+                "qualityScore" to assessment.score,
+                "verdict" to verdict.name.lowercase(),
+                "badSamples" to badSamples,
+                "wakeToCycleStartMs" to wakeToCycleStartMs,
+                "latencyProbeElapsedMs" to latencyProbeElapsedMs,
+                "speedProbeElapsedMs" to speedProbeElapsedMs,
+                "cycleElapsedMs" to (SystemClock.elapsedRealtime() - cycleStartedAtElapsed),
+                "wakeToPrimaryResultMs" to wakeStartedAtElapsed?.let {
+                    (SystemClock.elapsedRealtime() - it).coerceAtLeast(0L)
+                },
+            ),
+        )
+        if (wakeStartedAtElapsed != null && lastWakeAtElapsed == wakeStartedAtElapsed) {
+            lastWakeAtElapsed = null
+        }
+
+        val alternateProbeStarted = SystemClock.elapsedRealtime()
         val candidateProbe = alternate?.let { candidate ->
-            val shouldProbe = assessment.needsRapidRecheck || forceDeepProbe || sampleCount % 20 == 0
+            val periodicAlternateDue = nowElapsed - lastPeriodicAlternateProbeAtElapsed >=
+                maxOf(config.intervalSeconds * 20_000L, MIN_PERIODIC_ALTERNATE_INTERVAL_MS)
+            val shouldProbe = assessment.needsRapidRecheck || forceDeepProbe || periodicAlternateDue
+            if (periodicAlternateDue) lastPeriodicAlternateProbeAtElapsed = nowElapsed
             if (shouldProbe) probeAlternate(candidate, config) else alternateProbeCache[candidate.subId]
                 ?.takeIf { System.currentTimeMillis() - it.measuredAt < ALTERNATE_CACHE_MS }
                 ?.sample
         }
+        val alternateProbeElapsedMs = SystemClock.elapsedRealtime() - alternateProbeStarted
         val candidateAssessment = candidateProbe?.let { AutoSwitchDecider.assess(it, config) }
-        val usageStates = refreshDataUsage(lines)
+        val usageStates = usageStatesSnapshot(lines)
+        requestDataUsageRefresh(lines)
         val quotaAdvantage = alternate != null && DataPlanPolicy.candidateHasClearAdvantage(
             usageStates[current.subId],
             usageStates[alternate.subId],
+        )
+        val millisSinceSwitch = (System.currentTimeMillis() - prefs.lastSwitchAt).coerceAtLeast(0L)
+        val quotaTrialEligible = alternate != null && AutoSwitchDecider.shouldTryQuotaBalance(
+            current = assessment,
+            candidate = alternate,
+            config = config,
+            quotaAdvantage = quotaAdvantage,
+            millisSinceSwitch = millisSinceSwitch,
         )
         val candidatePreferred = candidateProbe != null && candidateAssessment != null &&
             AutoSwitchDecider.shouldPreferCandidate(
@@ -562,12 +666,8 @@ class MonitorService : Service() {
                 candidateAssessment,
                 sample,
                 candidateProbe,
-                quotaAdvantage = quotaAdvantage,
+                quotaAdvantage = quotaTrialEligible,
             )
-
-        AppState.update {
-            it.copy(lastLatencyMs = latency, lastSpeedKbps = speed, badSamples = badSamples)
-        }
         DiagnosticLog.info(
             this,
             "quality_result",
@@ -600,8 +700,14 @@ class MonitorService : Service() {
                 "alternateScore" to candidateAssessment?.score,
                 "candidatePreferred" to candidatePreferred,
                 "quotaAdvantage" to quotaAdvantage,
+                "quotaTrialEligible" to quotaTrialEligible,
                 "currentRemainingBytes" to usageStates[current.subId]?.remainingBytes,
                 "alternateRemainingBytes" to alternate?.let { usageStates[it.subId]?.remainingBytes },
+                "wakeToCycleStartMs" to wakeToCycleStartMs,
+                "latencyProbeElapsedMs" to latencyProbeElapsedMs,
+                "speedProbeElapsedMs" to speedProbeElapsedMs,
+                "alternateProbeElapsedMs" to alternateProbeElapsedMs,
+                "cycleElapsedMs" to (SystemClock.elapsedRealtime() - cycleStartedAtElapsed),
             ),
         )
 
@@ -611,12 +717,32 @@ class MonitorService : Service() {
         val trialDue = alternate != null && System.currentTimeMillis() -
             (lastComparisonTrialAt[alternate.subId] ?: 0L) >= COMPARISON_TRIAL_COOLDOWN_MS
         val directCandidateUnavailable = candidateProbe != null && candidateProbe.connectivityUnavailable()
+        val connectivityTrialNeeded = alternate != null && AutoSwitchDecider.shouldTryQualityRecovery(
+            current = assessment,
+            currentLine = current,
+            candidate = alternate,
+            config = config,
+            consecutiveThresholdReached = badSamples >= config.consecutiveFailures,
+        )
         val shouldTrialCompare = alternate != null && trialDue && directCandidateUnavailable &&
             !inCooldown && !inCall && powerManager.isInteractive &&
-            (badSamples >= config.consecutiveFailures || quotaAdvantage)
+            (connectivityTrialNeeded || quotaTrialEligible)
         if (shouldTrialCompare) {
             lastComparisonTrialAt[alternate.subId] = System.currentTimeMillis()
-            val result = compareByTemporaryDataSwitch(current, alternate, sample, assessment, config, lines, quotaAdvantage)
+            val result = compareByTemporaryDataSwitch(
+                current,
+                alternate,
+                sample,
+                assessment,
+                config,
+                lines,
+                quotaAdvantage = quotaTrialEligible,
+                reason = if (connectivityTrialNeeded) {
+                    COMPARISON_REASON_QUALITY_RECOVERY
+                } else {
+                    COMPARISON_REASON_QUOTA_BALANCE
+                },
+            )
             when (result) {
                 ComparisonResult.KEPT -> {
                     badSamples = 0
@@ -856,7 +982,8 @@ class MonitorService : Service() {
     }
 
     private fun latencyProbe(network: Network, allowDefaultFallback: Boolean): Long? {
-        val url = URL(LATENCY_URLS.first())
+        val endpoint = LATENCY_URLS[latencyEndpointIndex++ % LATENCY_URLS.size]
+        val url = URL(endpoint)
         if (boundNetworkProbeSupported != false) {
             val bound = latencyAttempt { network.openConnection(url) as HttpURLConnection }
             if (bound.isSuccess) {
@@ -870,29 +997,34 @@ class MonitorService : Service() {
             }
         }
         if (!allowDefaultFallback) return null
-        var lastFailure: Throwable? = null
-        LATENCY_URLS.forEach { endpoint ->
-            val result = latencyAttempt { URL(endpoint).openConnection() as HttpURLConnection }
-            if (result.isSuccess) return result.getOrNull()
-            lastFailure = result.exceptionOrNull()
-        }
-        Log.w(TAG, "all latency probes failed: ${lastFailure?.message}", lastFailure)
-        DiagnosticLog.warn(this, "latency_unavailable", "すべての遅延測定先が応答しませんでした", error = lastFailure)
+        val result = latencyAttempt { url.openConnection() as HttpURLConnection }
+        if (result.isSuccess) return result.getOrNull()
+        val failure = result.exceptionOrNull()
+        Log.w(TAG, "latency probe failed: ${failure?.message}", failure)
+        DiagnosticLog.warn(
+            this,
+            "latency_unavailable",
+            "遅延測定先が応答しませんでした · 次回は別の測定先を使用",
+            mapOf("endpointIndex" to ((latencyEndpointIndex - 1) % LATENCY_URLS.size)),
+            failure,
+        )
         return null
     }
 
     private fun latencyAttempt(open: () -> HttpURLConnection): Result<Long> = runCatching {
         val started = System.nanoTime()
         val connection = open()
+        activeProbeConnection.set(connection)
         try {
             connection.instanceFollowRedirects = false
-            connection.connectTimeout = 5_000
-            connection.readTimeout = 5_000
+            connection.connectTimeout = PROBE_TIMEOUT_MS
+            connection.readTimeout = PROBE_TIMEOUT_MS
             connection.useCaches = false
             connection.connect()
             connection.responseCode
             ((System.nanoTime() - started) / 1_000_000.0).roundToLong()
         } finally {
+            activeProbeConnection.compareAndSet(connection, null)
             connection.disconnect()
         }
     }
@@ -1000,17 +1132,34 @@ class MonitorService : Service() {
         config: MonitorConfig,
         lines: List<SimLine>,
         quotaAdvantage: Boolean,
+        reason: String,
     ): ComparisonResult {
+        val comparisonStartedAt = SystemClock.elapsedRealtime()
+        AppState.update {
+            it.copy(
+                status = "比較中 · ${candidate.title}へデータを一時切替",
+                lastLatencyMs = null,
+                lastSpeedKbps = null,
+            )
+        }
         DiagnosticLog.info(
             this,
             "comparison_trial_started",
             "候補SIMへ一時切替して比較測定",
-            mapOf("fromSubId" to current.subId, "toSubId" to candidate.subId, "fromScore" to currentAssessment.score),
+            mapOf(
+                "fromSubId" to current.subId,
+                "toSubId" to candidate.subId,
+                "fromScore" to currentAssessment.score,
+                "reason" to reason,
+            ),
         )
         val switched = setDefaultWithAudit(SimRole.DATA, candidate.subId, "comparison_probe", lines)
         if (switched.isFailure) return ComparisonResult.ABORTED
 
-        val deadline = SystemClock.elapsedRealtime() + COMPARISON_SETTLE_TIMEOUT_MS
+        val settleTimeoutMs = MonitorTiming.comparisonSettleTimeoutMs(
+            qualityRecovery = reason == COMPARISON_REASON_QUALITY_RECOVERY,
+        )
+        val deadline = SystemClock.elapsedRealtime() + settleTimeoutMs
         var network: Network? = null
         while (powerManager.isInteractive && SystemClock.elapsedRealtime() < deadline) {
             if (isWifiActive()) break
@@ -1028,13 +1177,53 @@ class MonitorService : Service() {
         if (!powerManager.isInteractive || isWifiActive() || network == null) {
             setDefaultWithAudit(SimRole.DATA, current.subId, "comparison_revert", sims.refresh())
                 .onSuccess { markSwitchSettling() }
-            DiagnosticLog.warn(this, "comparison_trial_aborted", "比較測定を中断して元のSIMへ復帰")
+            DiagnosticLog.warn(
+                this,
+                "comparison_trial_aborted",
+                "比較測定を中断して元のSIMへ復帰",
+                mapOf(
+                    "stage" to "network_settle",
+                    "reason" to reason,
+                    "settleTimeoutMs" to settleTimeoutMs,
+                    "durationMs" to (SystemClock.elapsedRealtime() - comparisonStartedAt),
+                ),
+            )
             return ComparisonResult.ABORTED
         }
 
         val refreshedCandidate = sims.refresh().firstOrNull { it.subId == candidate.subId } ?: candidate
         val latency = latencyProbe(network, allowDefaultFallback = true)
+        if (!powerManager.isInteractive || isWifiActive()) {
+            setDefaultWithAudit(SimRole.DATA, current.subId, "comparison_revert", sims.refresh())
+                .onSuccess { markSwitchSettling() }
+            DiagnosticLog.warn(
+                this,
+                "comparison_trial_aborted",
+                "比較測定を中断して元のSIMへ復帰",
+                mapOf(
+                    "stage" to "latency_probe",
+                    "reason" to reason,
+                    "durationMs" to (SystemClock.elapsedRealtime() - comparisonStartedAt),
+                ),
+            )
+            return ComparisonResult.ABORTED
+        }
         val speed = speedProbe(network, allowDefaultFallback = true)
+        if (!powerManager.isInteractive || isWifiActive()) {
+            setDefaultWithAudit(SimRole.DATA, current.subId, "comparison_revert", sims.refresh())
+                .onSuccess { markSwitchSettling() }
+            DiagnosticLog.warn(
+                this,
+                "comparison_trial_aborted",
+                "比較測定を中断して元のSIMへ復帰",
+                mapOf(
+                    "stage" to "speed_probe",
+                    "reason" to reason,
+                    "durationMs" to (SystemClock.elapsedRealtime() - comparisonStartedAt),
+                ),
+            )
+            return ComparisonResult.ABORTED
+        }
         val candidateSample = QualitySample(
             inService = refreshedCandidate.inService,
             serviceStateKnown = refreshedCandidate.serviceStateKnown,
@@ -1070,6 +1259,8 @@ class MonitorService : Service() {
                 "candidateScore" to candidateAssessment.score,
                 "quotaAdvantage" to quotaAdvantage,
                 "keepCandidate" to keep,
+                "reason" to reason,
+                "durationMs" to (SystemClock.elapsedRealtime() - comparisonStartedAt),
             ),
         )
         return if (keep) {
@@ -1093,49 +1284,92 @@ class MonitorService : Service() {
             ?.hasTransport(NetworkCapabilities.TRANSPORT_WIFI) == true
     }
 
-    private fun refreshDataUsage(lines: List<SimLine>): Map<Int, DataUsageState> {
+    private fun usageStatesSnapshot(lines: List<SimLine>): Map<Int, DataUsageState> {
         val plans = prefs.loadPlans().associateBy { it.subId }
         val now = System.currentTimeMillis()
-        val states = buildMap {
+        return buildMap {
             lines.forEach { line ->
                 val plan = plans[line.subId] ?: return@forEach
                 val window = DataPlanPolicy.window(plan) ?: return@forEach
                 val measured = if (plan.manualRemainingBytes != null) null else {
-                    val cached = usageCache[line.subId]?.takeIf {
+                    usageCache[line.subId]?.takeIf {
                         it.startMillis == window.startMillis && now - it.measuredAt < USAGE_CACHE_MS
-                    }
-                    if (cached != null) cached.bytes else {
-                        ShizukuBridge.mobileUsageBytes(
-                            line.subId,
-                            window.startMillis,
-                            minOf(now, window.endMillis),
-                        ).onSuccess { bytes ->
-                            usageCache[line.subId] = TimedUsage(bytes, window.startMillis, now)
-                        }.onFailure { error ->
-                            usageCache[line.subId] = TimedUsage(null, window.startMillis, now)
-                            DiagnosticLog.warn(
-                                this@MonitorService,
-                                "usage_unavailable",
-                                "SIM別通信量を取得できません",
-                                mapOf("subId" to line.subId, "name" to line.title),
-                                error,
-                            )
-                        }.getOrNull()
-                    }
+                    }?.bytes
                 }
                 DataPlanPolicy.state(plan, measured)?.let { put(line.subId, it) }
             }
         }
-        AppState.update { it.copy(dataUsage = states) }
-        return states
+    }
+
+    private fun requestDataUsageRefresh(lines: List<SimLine>) {
+        val plans = prefs.loadPlans().associateBy { it.subId }
+        val now = System.currentTimeMillis()
+        val needsRefresh = lines.any { line ->
+            val plan = plans[line.subId] ?: return@any false
+            if (plan.manualRemainingBytes != null) return@any false
+            val window = DataPlanPolicy.window(plan) ?: return@any false
+            usageCache[line.subId]?.let {
+                it.startMillis == window.startMillis && now - it.measuredAt < USAGE_CACHE_MS
+            } != true
+        }
+        val snapshot = usageStatesSnapshot(lines)
+        AppState.update { it.copy(dataUsage = snapshot) }
+        if (!needsRefresh || !ShizukuBridge.isReady() || !ShizukuBridge.isGranted()) return
+        if (!usageRefreshInFlight.compareAndSet(false, true)) return
+
+        usageWorker.execute {
+            val started = SystemClock.elapsedRealtime()
+            try {
+                plans.forEach { (subId, plan) ->
+                    if (stopped.get() || plan.manualRemainingBytes != null) return@forEach
+                    val line = lines.firstOrNull { it.subId == subId } ?: return@forEach
+                    val window = DataPlanPolicy.window(plan) ?: return@forEach
+                    val cached = usageCache[subId]
+                    if (cached != null && cached.startMillis == window.startMillis &&
+                        now - cached.measuredAt < USAGE_CACHE_MS
+                    ) return@forEach
+                    ShizukuBridge.mobileUsageBytes(
+                        subId,
+                        window.startMillis,
+                        minOf(now, window.endMillis),
+                    ).onSuccess { bytes ->
+                        usageCache[subId] = TimedUsage(bytes, window.startMillis, System.currentTimeMillis())
+                    }.onFailure { error ->
+                        usageCache[subId] = TimedUsage(null, window.startMillis, System.currentTimeMillis())
+                        DiagnosticLog.warn(
+                            this@MonitorService,
+                            "usage_unavailable",
+                            "SIM別通信量を取得できません",
+                            mapOf("subId" to subId, "name" to line.title),
+                            error,
+                        )
+                    }
+                }
+                val refreshed = usageStatesSnapshot(lines)
+                AppState.update { it.copy(dataUsage = refreshed) }
+                DiagnosticLog.info(
+                    this@MonitorService,
+                    "usage_refresh_completed",
+                    "SIM別通信量をバックグラウンド更新",
+                    mapOf(
+                        "durationMs" to (SystemClock.elapsedRealtime() - started),
+                        "subIds" to refreshed.keys.joinToString(","),
+                    ),
+                )
+                if (powerManager.isInteractive && !stopped.get()) scheduleNext(0)
+            } finally {
+                usageRefreshInFlight.set(false)
+            }
+        }
     }
 
     private fun speedAttempt(open: () -> HttpURLConnection): Result<Long> = runCatching {
         val started = System.nanoTime()
         val connection = open()
+        activeProbeConnection.set(connection)
         try {
-            connection.connectTimeout = 7_000
-            connection.readTimeout = 7_000
+            connection.connectTimeout = SPEED_TIMEOUT_MS
+            connection.readTimeout = SPEED_TIMEOUT_MS
             connection.useCaches = false
             var bytes = 0L
             connection.inputStream.use { input ->
@@ -1149,6 +1383,7 @@ class MonitorService : Service() {
             val seconds = (System.nanoTime() - started) / 1_000_000_000.0
             ((bytes * 8.0 / 1_000.0) / seconds).roundToLong()
         } finally {
+            activeProbeConnection.compareAndSet(connection, null)
             connection.disconnect()
         }
     }
@@ -1203,11 +1438,17 @@ class MonitorService : Service() {
         )
         private const val SPEED_URL = "https://speed.cloudflare.com/__down?bytes=65536"
         private const val NETWORK_SETTLE_GRACE_MS = 10_000L
-        private const val ALTERNATE_REQUEST_TIMEOUT_MS = 8_000L
+        private const val PROBE_TIMEOUT_MS = 2_500
+        private const val SPEED_TIMEOUT_MS = 4_000
+        private const val ALTERNATE_REQUEST_TIMEOUT_MS = 2_500L
         private const val ALTERNATE_CACHE_MS = 30_000L
         private const val USAGE_CACHE_MS = 15L * 60_000L
-        private const val COMPARISON_SETTLE_TIMEOUT_MS = 10_000L
         private const val COMPARISON_TRIAL_COOLDOWN_MS = 5L * 60_000L
+        private const val COMPARISON_REASON_QUALITY_RECOVERY = "quality_recovery"
+        private const val COMPARISON_REASON_QUOTA_BALANCE = "quota_balance"
+        private const val MIN_PERIODIC_SPEED_INTERVAL_MS = 60_000L
+        private const val RAPID_SPEED_MIN_GAP_MS = 3_000L
+        private const val MIN_PERIODIC_ALTERNATE_INTERVAL_MS = 5L * 60_000L
         private const val ACTION_DEFAULT_DATA_SUBSCRIPTION_CHANGED =
             "android.intent.action.ACTION_DEFAULT_DATA_SUBSCRIPTION_CHANGED"
         private const val ACTION_DEFAULT_VOICE_SUBSCRIPTION_CHANGED =

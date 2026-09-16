@@ -18,6 +18,17 @@ class AutoSwitchDeciderTest {
         speed: Long? = 5_000,
     ) = QualitySample(inService, known, level, dbm, validated, latency, speed)
 
+    private fun line(dbm: Int? = -100, level: Int = 3) = SimLine(
+        subId = 5,
+        slotIndex = 0,
+        displayName = "candidate",
+        carrierName = "candidate",
+        signalLevel = level,
+        dbm = dbm,
+        inService = true,
+        serviceStateKnown = true,
+    )
+
     @Test fun healthySampleStays() {
         assertFalse(AutoSwitchDecider.isBad(sample(), config))
     }
@@ -116,6 +127,105 @@ class AutoSwitchDeciderTest {
                 currentSample,
                 candidateSample,
                 quotaAdvantage = true,
+            )
+        )
+    }
+
+    @Test fun quotaDoesNotTriggerWhileCurrentConnectionIsDegraded() {
+        val current = AutoSwitchDecider.assess(sample(speed = 2_483), config)
+        assertFalse(
+            AutoSwitchDecider.shouldTryQuotaBalance(current, line(), config, true, 30L * 60_000L)
+        )
+    }
+
+    @Test fun quotaDoesNotProbeWeakCandidate() {
+        val current = AutoSwitchDecider.assess(sample(), config)
+        assertFalse(
+            AutoSwitchDecider.shouldTryQuotaBalance(current, line(dbm = -119), config, true, 30L * 60_000L)
+        )
+    }
+
+    @Test fun quotaWaitsForConnectionStability() {
+        val current = AutoSwitchDecider.assess(sample(), config)
+        assertFalse(
+            AutoSwitchDecider.shouldTryQuotaBalance(current, line(), config, true, 5L * 60_000L)
+        )
+        assertTrue(
+            AutoSwitchDecider.shouldTryQuotaBalance(current, line(), config, true, 15L * 60_000L)
+        )
+    }
+
+    @Test fun degradedConnectionDoesNotProbeClearlyWeakerRadio() {
+        val currentSample = sample(dbm = -105, speed = 2_483)
+        assertFalse(
+            AutoSwitchDecider.shouldTryQualityRecovery(
+                current = AutoSwitchDecider.assess(currentSample, config),
+                currentLine = line(dbm = -105),
+                candidate = line(dbm = -119),
+                config = config,
+                consecutiveThresholdReached = true,
+            )
+        )
+    }
+
+    @Test fun degradedConnectionCanProbeClearlyStrongerRadio() {
+        val currentSample = sample(dbm = -121, speed = 1_000)
+        assertTrue(
+            AutoSwitchDecider.shouldTryQualityRecovery(
+                current = AutoSwitchDecider.assess(currentSample, config),
+                currentLine = line(dbm = -121),
+                candidate = line(dbm = -100),
+                config = config,
+                consecutiveThresholdReached = true,
+            )
+        )
+    }
+
+    @Test fun connectivityFailureStillAllowsWeakButAvailableCandidateProbe() {
+        val currentSample = sample(dbm = -100, validated = false, latency = null, speed = null)
+        assertTrue(
+            AutoSwitchDecider.shouldTryQualityRecovery(
+                current = AutoSwitchDecider.assess(currentSample, config),
+                currentLine = line(dbm = -100),
+                candidate = line(dbm = -119, level = 1),
+                config = config,
+                consecutiveThresholdReached = true,
+            )
+        )
+    }
+
+    @Test fun yesterdayRecoveryAndTodayWeakQuotaReturnDoNotConflict() {
+        val incidentConfig = config.copy(latencyThresholdMs = 600, consecutiveFailures = 2)
+        val yesterdayLinemo = sample(level = 1, dbm = -121, latency = 1_467, speed = 952)
+        assertTrue(
+            AutoSwitchDecider.shouldTryQualityRecovery(
+                current = AutoSwitchDecider.assess(yesterdayLinemo, incidentConfig),
+                currentLine = line(dbm = -121, level = 1),
+                candidate = line(dbm = -107, level = 3),
+                config = incidentConfig,
+                consecutiveThresholdReached = true,
+            )
+        )
+
+        val todayPovo = sample(level = 3, dbm = -105, latency = 108, speed = 2_483)
+        val todayLinemo = line(dbm = -119, level = 1)
+        val todayAssessment = AutoSwitchDecider.assess(todayPovo, incidentConfig)
+        assertFalse(
+            AutoSwitchDecider.shouldTryQualityRecovery(
+                current = todayAssessment,
+                currentLine = line(dbm = -105, level = 3),
+                candidate = todayLinemo,
+                config = incidentConfig,
+                consecutiveThresholdReached = true,
+            )
+        )
+        assertFalse(
+            AutoSwitchDecider.shouldTryQuotaBalance(
+                current = todayAssessment,
+                candidate = todayLinemo,
+                config = incidentConfig,
+                quotaAdvantage = true,
+                millisSinceSwitch = 30L * 60_000L,
             )
         )
     }

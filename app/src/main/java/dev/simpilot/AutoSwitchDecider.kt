@@ -22,6 +22,8 @@ data class QualityAssessment(
 }
 
 object AutoSwitchDecider {
+    private const val QUOTA_BALANCE_STABILITY_MS = 15L * 60_000L
+
     fun assess(sample: QualitySample, config: MonitorConfig): QualityAssessment {
         if (sample.serviceStateKnown && !sample.inService) {
             return QualityAssessment(QualityVerdict.BAD, 100, listOf("圏外"), connectivityFailure = true)
@@ -100,6 +102,38 @@ object AutoSwitchDecider {
         if (current.verdict != QualityVerdict.GOOD && signalGain >= 6 && speedGain) return true
         return quotaAdvantage && current.verdict == QualityVerdict.GOOD &&
             candidate.verdict == QualityVerdict.GOOD && candidate.score <= current.score + 5
+    }
+
+    fun shouldTryQuotaBalance(
+        current: QualityAssessment,
+        candidate: SimLine,
+        config: MonitorConfig,
+        quotaAdvantage: Boolean,
+        millisSinceSwitch: Long,
+    ): Boolean {
+        if (!quotaAdvantage || current.verdict != QualityVerdict.GOOD) return false
+        if (millisSinceSwitch < QUOTA_BALANCE_STABILITY_MS) return false
+        return candidate.dbm?.let { it > config.weakSignalDbm + 6 }
+            ?: (candidate.signalLevel >= 3)
+    }
+
+    fun shouldTryQualityRecovery(
+        current: QualityAssessment,
+        currentLine: SimLine,
+        candidate: SimLine,
+        config: MonitorConfig,
+        consecutiveThresholdReached: Boolean,
+    ): Boolean {
+        if (!consecutiveThresholdReached || !current.needsRapidRecheck) return false
+        if (current.connectivityFailure) return canUseAlternate(candidate)
+        val candidateDbm = candidate.dbm
+        val currentDbm = currentLine.dbm
+        if (candidateDbm != null) {
+            if (candidateDbm <= config.weakSignalDbm) return false
+            return currentDbm == null || candidateDbm >= currentDbm - 6
+        }
+        return candidate.signalLevel >= 2 &&
+            (currentLine.signalLevel < 0 || candidate.signalLevel >= currentLine.signalLevel - 1)
     }
 
     private fun signalPenalty(sample: QualitySample, config: MonitorConfig): Int {
