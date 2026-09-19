@@ -81,21 +81,31 @@ Android 13以降では通知権限を宣言・要求しないため、監視通�
 
 現在ログは最大8MBのJSON Lines、過去ログは最大16世代のgzip圧縮JSON Linesとして、Direct Boot対応のアプリ専用領域に保存します。各NetMonster観測でPrimary / Secondary / Neighbor全セルの全取得値を間引かず記録し、無線ページ表示中の5秒観測も保存します。電話番号、ICCID、IMSI、IMEIは記録しません。各監視周期には通信経路、SIM名／ID、dBm、RSRP/RSRQ/SINR、CQI、帯域幅、CA、セル識別情報、無線評価、品質スコアと内訳、両SIMの比較値、残容量、判定、切替しなかった理由、Shizuku状態を含みます。SIM Pilotが要求した変更は `app/ui_manual`、`app/auto_failover`、`app/comparison_probe`、`app/comparison_revert`、`app/wifi_restore`、それ以外の変更は `external_user_or_system` と記録します。
 
-接続中の端末からログと現在のシステム状態をまとめて取得できます。
-アプリ専用領域のJSONLを`run-as`で取得できるのはデバッグ版だけです。GitHub配布用の
-非デバッグrelease版では、同じスクリプトが取得可能な`dumpsys`、既定SIM、logcatだけを保存します。
+接続中の端末からログと現在のシステム状態をまとめて取得できます。デバッグ版は`run-as`、
+GitHub配布用の非デバッグrelease版は`android.permission.DUMP`でshellだけに公開した読み取り専用
+ContentProviderを自動的に使います。どちらも現在JSONL、gzipアーカイブ、`dumpsys`、既定SIM、
+logcatを同じスクリプトで保存できます。
 
 ```bash
 ./tools/pull-device-logs.sh 192.168.3.13:5555
 ```
 
-現在ログだけを直接読む場合:
+デバッグ版で現在ログだけを直接読む場合:
 
 ```bash
 adb -s 192.168.3.13:5555 exec-out run-as dev.simpilot cat /data/user_de/0/dev.simpilot/files/diagnostics/sim-pilot-current.jsonl
 ```
 
-この直接取得もデバッグ版専用です。
+release版で現在ログだけを直接保存する場合:
+
+```bash
+adb -s 192.168.3.13:5555 exec-out content read \
+  --uri content://dev.simpilot.diagnostics/logs/sim-pilot-current.jsonl > sim-pilot-current.jsonl
+```
+
+アプリ画面では「設定 → 診断ログ」から最近の無線・判定・切替・警告ログを絞り込み表示できます。
+各項目の生JSONも確認でき、「ZIPへ保存」で現在ログと全アーカイブを端末上の任意の保存先へ
+書き出せます。ストレージ権限は要求しません。
 
 設定画面の「Wi-Fi接続時」では、復帰機能全体とデータ・通話・メッセージの各対象を独立してON/OFFできます。「現在の既定SIMを復帰先にセット」を使うと、現在の3つの割り当てをまとめて記録できます。SIM名やSIMの有無は `SubscriptionManager` から毎回取得し、通信会社名をコードへ固定していません。
 

@@ -21,7 +21,17 @@ if "${adb_command[@]}" shell run-as dev.simpilot test -d "$device_directory" 2>/
     fi
   done
 else
-  echo "SIM Pilot is not debuggable; skipping app-private JSONL files." >&2
+  provider_uri="content://dev.simpilot.diagnostics/logs"
+  provider_files=$("${adb_command[@]}" shell content query --uri "$provider_uri" --projection _display_name 2>/dev/null \
+    | sed -n 's/.*_display_name=\([^, ]*\).*/\1/p' | tr -d '\r')
+  if [[ -n "$provider_files" ]]; then
+    while IFS= read -r filename; do
+      [[ -n "$filename" ]] || continue
+      "${adb_command[@]}" exec-out content read --uri "$provider_uri/$filename" > "$output_dir/$filename"
+    done <<< "$provider_files"
+  else
+    echo "SIM Pilot diagnostic provider is unavailable; skipping app-private JSONL files." >&2
+  fi
 fi
 
 "${adb_command[@]}" shell dumpsys package dev.simpilot > "$output_dir/package.txt"

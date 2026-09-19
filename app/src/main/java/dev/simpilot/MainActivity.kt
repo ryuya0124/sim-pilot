@@ -951,14 +951,20 @@ private fun SettingsPageScreen(
             backDirection = 1f
         }
     }
+    val pageTransitionModifier = Modifier.graphicsLayer {
+        translationX = size.width * 0.16f * backProgress * backDirection
+        scaleX = 1f - 0.025f * backProgress
+        scaleY = 1f - 0.025f * backProgress
+        alpha = 1f - 0.14f * backProgress
+    }
     Surface(Modifier.fillMaxSize(), color = MaterialTheme.colorScheme.surface) {
-        LazyColumn(
-            modifier = Modifier.graphicsLayer {
-                translationX = size.width * 0.16f * backProgress * backDirection
-                scaleX = 1f - 0.025f * backProgress
-                scaleY = 1f - 0.025f * backProgress
-                alpha = 1f - 0.14f * backProgress
-            },
+        if (page == SettingsPage.LOGS) {
+            DiagnosticLogsScreen(
+                onBack = { page = SettingsPage.HOME },
+                modifier = pageTransitionModifier,
+            )
+        } else LazyColumn(
+            modifier = pageTransitionModifier,
             contentPadding = PaddingValues(
                 start = 18.dp,
                 end = 18.dp,
@@ -983,6 +989,11 @@ private fun SettingsPageScreen(
                     item {
                         SettingsCategory(Icons.Rounded.DataUsage, "データプラン", "SIM別容量・期間・povoトッピング") {
                             page = SettingsPage.DATA_PLANS
+                        }
+                    }
+                    item {
+                        SettingsCategory(Icons.Rounded.DataUsage, "診断ログ", "無線・判定・切替履歴の表示とZIP保存") {
+                            page = SettingsPage.LOGS
                         }
                     }
                     item {
@@ -1051,6 +1062,7 @@ private fun SettingsPageScreen(
                     item { SettingsPageHeader("データプラン") { page = SettingsPage.HOME } }
                     item { DataPlanSettings(lines = lines, plans = plans, onPlansChange = onPlansChange) }
                 }
+                SettingsPage.LOGS -> Unit
                 SettingsPage.LICENSES -> {
                     item { SettingsPageHeader("ライセンス") { page = SettingsPage.HOME } }
                     item {
@@ -1083,6 +1095,7 @@ private enum class SettingsPage {
     WIFI,
     QUALITY,
     DATA_PLANS,
+    LOGS,
     LICENSES,
     APP_LICENSE,
     NETMONSTER_LICENSE,

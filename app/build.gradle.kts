@@ -11,8 +11,8 @@ android {
         applicationId = "dev.simpilot"
         minSdk = 31
         targetSdk = 37
-        versionCode = 17
-        versionName = "1.8.2"
+        versionCode = 18
+        versionName = "1.9.0"
 
         testInstrumentationRunner = "androidx.test.runner.AndroidJUnitRunner"
     }
