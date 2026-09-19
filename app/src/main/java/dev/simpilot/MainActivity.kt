@@ -70,6 +70,7 @@ import androidx.compose.material3.FilterChip
 import androidx.compose.material3.HorizontalDivider
 import androidx.compose.material3.Icon
 import androidx.compose.material3.IconButton
+import androidx.compose.material3.LocalContentColor
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.NavigationBar
 import androidx.compose.material3.NavigationBarItem
@@ -84,6 +85,7 @@ import androidx.compose.material3.dynamicDarkColorScheme
 import androidx.compose.material3.dynamicLightColorScheme
 import androidx.compose.material3.lightColorScheme
 import androidx.compose.runtime.Composable
+import androidx.compose.runtime.CompositionLocalProvider
 import androidx.compose.runtime.DisposableEffect
 import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
@@ -375,116 +377,118 @@ private fun SimPilotApp(repository: SimRepository) {
         }
     }
 
-    Box(
-        Modifier
-            .fillMaxSize()
-            .background(
-                Brush.verticalGradient(
-                    listOf(
-                        MaterialTheme.colorScheme.surface,
-                        MaterialTheme.colorScheme.surfaceContainerLowest,
-                        MaterialTheme.colorScheme.surfaceContainer,
-                    )
-                )
-            )
-    ) {
+    CompositionLocalProvider(LocalContentColor provides MaterialTheme.colorScheme.onSurface) {
         Box(
             Modifier
                 .fillMaxSize()
-                .graphicsLayer {
-                    translationX = size.width * 0.12f * appBackProgress * appBackDirection
-                    scaleX = 1f - 0.03f * appBackProgress
-                    scaleY = 1f - 0.03f * appBackProgress
-                    alpha = 1f - 0.12f * appBackProgress
-                }
+                .background(
+                    Brush.verticalGradient(
+                        listOf(
+                            MaterialTheme.colorScheme.surface,
+                            MaterialTheme.colorScheme.surfaceContainerLowest,
+                            MaterialTheme.colorScheme.surfaceContainer,
+                        )
+                    )
+                )
         ) {
-            when (appPage) {
-                AppPage.HOME -> LazyColumn(
-                    modifier = Modifier.fillMaxSize(),
-                    contentPadding = PaddingValues(
-                        start = 18.dp,
-                        end = 18.dp,
-                        top = WindowInsets.safeDrawing.asPaddingValues().calculateTopPadding() + 10.dp,
-                        bottom = WindowInsets.safeDrawing.asPaddingValues().calculateBottomPadding() + 112.dp,
-                    ),
-                    verticalArrangement = Arrangement.spacedBy(14.dp),
-                ) {
-                    item { Hero(snapshot, config) }
-                    if (!snapshot.shizukuGranted) {
+            Box(
+                Modifier
+                    .fillMaxSize()
+                    .graphicsLayer {
+                        translationX = size.width * 0.12f * appBackProgress * appBackDirection
+                        scaleX = 1f - 0.03f * appBackProgress
+                        scaleY = 1f - 0.03f * appBackProgress
+                        alpha = 1f - 0.12f * appBackProgress
+                    }
+            ) {
+                when (appPage) {
+                    AppPage.HOME -> LazyColumn(
+                        modifier = Modifier.fillMaxSize(),
+                        contentPadding = PaddingValues(
+                            start = 18.dp,
+                            end = 18.dp,
+                            top = WindowInsets.safeDrawing.asPaddingValues().calculateTopPadding() + 10.dp,
+                            bottom = WindowInsets.safeDrawing.asPaddingValues().calculateBottomPadding() + 112.dp,
+                        ),
+                        verticalArrangement = Arrangement.spacedBy(14.dp),
+                    ) {
+                        item { Hero(snapshot, config) }
+                        if (!snapshot.shizukuGranted) {
+                            item {
+                                ShizukuCard(
+                                    ready = snapshot.shizukuReady,
+                                    onRequest = {
+                                        if (snapshot.shizukuReady) ShizukuBridge.requestPermission(REQUEST_SHIZUKU)
+                                        else runCatching {
+                                            val launch = context.packageManager.getLaunchIntentForPackage("af.shizuku.plus.api")
+                                                ?: context.packageManager.getLaunchIntentForPackage("moe.shizuku.privileged.api")
+                                            if (launch != null) context.startActivity(launch)
+                                        }
+                                    },
+                                )
+                            }
+                        }
                         item {
-                            ShizukuCard(
-                                ready = snapshot.shizukuReady,
-                                onRequest = {
-                                    if (snapshot.shizukuReady) ShizukuBridge.requestPermission(REQUEST_SHIZUKU)
-                                    else runCatching {
-                                        val launch = context.packageManager.getLaunchIntentForPackage("af.shizuku.plus.api")
-                                            ?: context.packageManager.getLaunchIntentForPackage("moe.shizuku.privileged.api")
-                                        if (launch != null) context.startActivity(launch)
-                                    }
-                                },
+                            AutoCard(
+                                config = config,
+                                running = snapshot.monitorRunning,
+                                backend = snapshot.switchBackend,
+                                onChange = ::persist,
+                                onTest = { MonitorService.start(context, testNow = true, reason = "ui_quality_test") },
                             )
                         }
-                    }
-                    item {
-                        AutoCard(
-                            config = config,
-                            running = snapshot.monitorRunning,
-                            backend = snapshot.switchBackend,
-                            onChange = ::persist,
-                            onTest = { MonitorService.start(context, testNow = true, reason = "ui_quality_test") },
-                        )
-                    }
-                    item {
-                        Text("既定SIM", style = MaterialTheme.typography.titleLarge, fontWeight = FontWeight.Bold)
-                        Text(
-                            "データ・通話・メッセージは独立して変更されます",
-                            style = MaterialTheme.typography.bodyMedium,
-                            color = MaterialTheme.colorScheme.onSurfaceVariant,
-                        )
-                    }
-                    item {
-                        BoxWithConstraints {
-                            val wide = maxWidth >= 720.dp
-                            if (wide) {
-                                Row(horizontalArrangement = Arrangement.spacedBy(12.dp)) {
-                                    RoleCard(SimRole.DATA, snapshot.dataSubId, snapshot.lines, busyRole, !snapshot.backendChecked || SimRole.DATA in snapshot.supportedRoles, Modifier.weight(1f), ::switch)
-                                    RoleCard(SimRole.VOICE, snapshot.voiceSubId, snapshot.lines, busyRole, !snapshot.backendChecked || SimRole.VOICE in snapshot.supportedRoles, Modifier.weight(1f), ::switch)
-                                    RoleCard(SimRole.SMS, snapshot.smsSubId, snapshot.lines, busyRole, !snapshot.backendChecked || SimRole.SMS in snapshot.supportedRoles, Modifier.weight(1f), ::switch)
-                                }
-                            } else {
-                                Column(verticalArrangement = Arrangement.spacedBy(12.dp)) {
-                                    RoleCard(SimRole.DATA, snapshot.dataSubId, snapshot.lines, busyRole, !snapshot.backendChecked || SimRole.DATA in snapshot.supportedRoles, Modifier.fillMaxWidth(), ::switch)
-                                    RoleCard(SimRole.VOICE, snapshot.voiceSubId, snapshot.lines, busyRole, !snapshot.backendChecked || SimRole.VOICE in snapshot.supportedRoles, Modifier.fillMaxWidth(), ::switch)
-                                    RoleCard(SimRole.SMS, snapshot.smsSubId, snapshot.lines, busyRole, !snapshot.backendChecked || SimRole.SMS in snapshot.supportedRoles, Modifier.fillMaxWidth(), ::switch)
+                        item {
+                            Text("既定SIM", style = MaterialTheme.typography.titleLarge, fontWeight = FontWeight.Bold)
+                            Text(
+                                "データ・通話・メッセージは独立して変更されます",
+                                style = MaterialTheme.typography.bodyMedium,
+                                color = MaterialTheme.colorScheme.onSurfaceVariant,
+                            )
+                        }
+                        item {
+                            BoxWithConstraints {
+                                val wide = maxWidth >= 720.dp
+                                if (wide) {
+                                    Row(horizontalArrangement = Arrangement.spacedBy(12.dp)) {
+                                        RoleCard(SimRole.DATA, snapshot.dataSubId, snapshot.lines, busyRole, !snapshot.backendChecked || SimRole.DATA in snapshot.supportedRoles, Modifier.weight(1f), ::switch)
+                                        RoleCard(SimRole.VOICE, snapshot.voiceSubId, snapshot.lines, busyRole, !snapshot.backendChecked || SimRole.VOICE in snapshot.supportedRoles, Modifier.weight(1f), ::switch)
+                                        RoleCard(SimRole.SMS, snapshot.smsSubId, snapshot.lines, busyRole, !snapshot.backendChecked || SimRole.SMS in snapshot.supportedRoles, Modifier.weight(1f), ::switch)
+                                    }
+                                } else {
+                                    Column(verticalArrangement = Arrangement.spacedBy(12.dp)) {
+                                        RoleCard(SimRole.DATA, snapshot.dataSubId, snapshot.lines, busyRole, !snapshot.backendChecked || SimRole.DATA in snapshot.supportedRoles, Modifier.fillMaxWidth(), ::switch)
+                                        RoleCard(SimRole.VOICE, snapshot.voiceSubId, snapshot.lines, busyRole, !snapshot.backendChecked || SimRole.VOICE in snapshot.supportedRoles, Modifier.fillMaxWidth(), ::switch)
+                                        RoleCard(SimRole.SMS, snapshot.smsSubId, snapshot.lines, busyRole, !snapshot.backendChecked || SimRole.SMS in snapshot.supportedRoles, Modifier.fillMaxWidth(), ::switch)
+                                    }
                                 }
                             }
                         }
+                        item { QualityCard(snapshot) }
+                        item { SimDetails(snapshot.lines, snapshot.dataSubId, snapshot.dataUsage) }
                     }
-                    item { QualityCard(snapshot) }
-                    item { SimDetails(snapshot.lines, snapshot.dataSubId, snapshot.dataUsage) }
+                    AppPage.RADIO -> RadioDetailsPage(
+                        lines = snapshot.lines,
+                        refreshing = radioRefreshing,
+                        onRefresh = { radioRefreshToken++ },
+                    )
+                    AppPage.SETTINGS -> SettingsPageScreen(
+                        config = config,
+                        lines = snapshot.lines,
+                        dataSubId = snapshot.dataSubId,
+                        voiceSubId = snapshot.voiceSubId,
+                        smsSubId = snapshot.smsSubId,
+                        plans = plans,
+                        onChange = ::persist,
+                        onPlansChange = ::persistPlans,
+                    )
                 }
-                AppPage.RADIO -> RadioDetailsPage(
-                    lines = snapshot.lines,
-                    refreshing = radioRefreshing,
-                    onRefresh = { radioRefreshToken++ },
-                )
-                AppPage.SETTINGS -> SettingsPageScreen(
-                    config = config,
-                    lines = snapshot.lines,
-                    dataSubId = snapshot.dataSubId,
-                    voiceSubId = snapshot.voiceSubId,
-                    smsSubId = snapshot.smsSubId,
-                    plans = plans,
-                    onChange = ::persist,
-                    onPlansChange = ::persistPlans,
-                )
             }
+            AppNavigationBar(
+                selected = appPage,
+                onSelected = { appPage = it },
+                modifier = Modifier.align(Alignment.BottomCenter),
+            )
         }
-        AppNavigationBar(
-            selected = appPage,
-            onSelected = { appPage = it },
-            modifier = Modifier.align(Alignment.BottomCenter),
-        )
     }
 }
 
