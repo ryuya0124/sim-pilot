@@ -10,6 +10,10 @@ data class QualitySample(
     val speedKbps: Long?,
     val rsrqDb: Double? = null,
     val sinrDb: Double? = null,
+    val radioPenalty: Int = 0,
+    val radioCapacityScore: Int? = null,
+    val radioConfidence: Int = 0,
+    val radioReasons: List<String> = emptyList(),
 )
 
 enum class QualityVerdict { GOOD, DEGRADED, BAD, INCONCLUSIVE }
@@ -47,6 +51,10 @@ object AutoSwitchDecider {
         if (sample.sinrDb != null && sinrPenalty(sample.sinrDb) > 0) {
             reasons += "雑音比 SINR ${"%.1f".format(sample.sinrDb)}dB"
         }
+
+        val radioStructurePenalty = sample.radioPenalty.coerceIn(0, 28)
+        score += radioStructurePenalty
+        if (radioStructurePenalty > 0) reasons += sample.radioReasons.ifEmpty { listOf("無線構成") }
 
         sample.latencyMs?.let { latency ->
             val threshold = config.latencyThresholdMs.coerceAtLeast(100)
@@ -101,7 +109,7 @@ object AutoSwitchDecider {
     ): Boolean {
         if (candidate.connectivityFailure) return false
         if (current.connectivityFailure) return true
-        if (candidate.score + 15 <= current.score) return true
+        if (candidate.score + 12 <= current.score) return true
 
         val signalGain = when {
             currentSample.dbm != null && candidateSample.dbm != null -> candidateSample.dbm - currentSample.dbm
@@ -111,8 +119,15 @@ object AutoSwitchDecider {
             candidateSample.speedKbps?.let { candidateSpeed -> candidateSpeed >= currentSpeed * 3 / 2 }
         } == true
         if (current.verdict != QualityVerdict.GOOD && signalGain >= 6 && speedGain) return true
+        val capacityGain = currentSample.radioCapacityScore?.let { currentCapacity ->
+            candidateSample.radioCapacityScore?.let { candidateCapacity -> candidateCapacity - currentCapacity }
+        }
+        val radioEvidenceStrong = currentSample.radioConfidence >= 50 && candidateSample.radioConfidence >= 50
+        if (current.verdict != QualityVerdict.GOOD && radioEvidenceStrong && capacityGain != null &&
+            capacityGain >= 18 && candidate.score <= current.score + 3 && signalGain >= -3) return true
         return quotaAdvantage && current.verdict == QualityVerdict.GOOD &&
-            candidate.verdict == QualityVerdict.GOOD && candidate.score <= current.score + 5
+            candidate.verdict == QualityVerdict.GOOD && candidate.score <= current.score + 3 &&
+            (capacityGain == null || capacityGain >= -12)
     }
 
     fun shouldTryQuotaBalance(
@@ -124,7 +139,9 @@ object AutoSwitchDecider {
     ): Boolean {
         if (!quotaAdvantage || current.verdict != QualityVerdict.GOOD) return false
         if (millisSinceSwitch < QUOTA_BALANCE_STABILITY_MS) return false
-        candidate.radio?.let { if (radioQualityPenalty(it.rsrqDb, it.sinrDb) >= 20) return false }
+        candidate.radio?.let {
+            if (radioQualityPenalty(it.rsrqDb, it.sinrDb) >= 20 || RadioIntelligence.assess(it).penalty >= 12) return false
+        }
         return candidate.dbm?.let { it > config.weakSignalDbm + 6 }
             ?: (candidate.signalLevel >= 3)
     }
@@ -144,12 +161,18 @@ object AutoSwitchDecider {
         val candidateRadioPenalty = candidate.radio?.let { radioQualityPenalty(it.rsrqDb, it.sinrDb) }
         val qualityClearlyBetter = currentRadioPenalty != null && candidateRadioPenalty != null &&
             candidateRadioPenalty + 10 <= currentRadioPenalty
+        val currentIntelligence = RadioIntelligence.assess(currentLine.radio)
+        val candidateIntelligence = RadioIntelligence.assess(candidate.radio)
+        val structureClearlyBetter = currentIntelligence.confidence >= 50 && candidateIntelligence.confidence >= 50 &&
+            (candidateIntelligence.penalty + 8 <= currentIntelligence.penalty ||
+                candidateIntelligence.capacityScore >= currentIntelligence.capacityScore + 18)
         if (candidateDbm != null) {
             if (candidateDbm <= config.weakSignalDbm) return false
-            return currentDbm == null || candidateDbm >= currentDbm - 6 || qualityClearlyBetter
+            return currentDbm == null || candidateDbm >= currentDbm - 6 || qualityClearlyBetter || structureClearlyBetter
         }
         return candidate.signalLevel >= 2 &&
-            (currentLine.signalLevel < 0 || candidate.signalLevel >= currentLine.signalLevel - 1 || qualityClearlyBetter)
+            (currentLine.signalLevel < 0 || candidate.signalLevel >= currentLine.signalLevel - 1 ||
+                qualityClearlyBetter || structureClearlyBetter)
     }
 
     fun radioQualityPenalty(rsrqDb: Double?, sinrDb: Double?): Int =

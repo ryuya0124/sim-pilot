@@ -10,7 +10,11 @@ fi
 
 mkdir -p "$output_dir"
 device_directory="/data/user_de/0/dev.simpilot/files/diagnostics"
-for filename in sim-pilot-current.jsonl sim-pilot.1.jsonl sim-pilot.2.jsonl sim-pilot.3.jsonl sim-pilot.4.jsonl; do
+filenames=(sim-pilot-current.jsonl)
+for index in $(seq 1 16); do
+  filenames+=("sim-pilot.$index.jsonl.gz" "sim-pilot.$index.jsonl")
+done
+for filename in "${filenames[@]}"; do
   if "${adb_command[@]}" shell run-as dev.simpilot test -f "$device_directory/$filename"; then
     "${adb_command[@]}" exec-out run-as dev.simpilot cat "$device_directory/$filename" > "$output_dir/$filename"
   fi

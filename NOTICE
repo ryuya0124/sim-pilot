@@ -1,0 +1,18 @@
+SIM Pilot
+Copyright (c) 2026 ryuya0124. All rights reserved.
+
+This product includes NetMonster Core 1.3.0.
+Copyright 2019 Michal Mroček.
+NetMonster Core is licensed under the Apache License, Version 2.0.
+https://github.com/mroczis/netmonster-core
+
+The complete third-party license text is included at:
+app/src/main/assets/licenses/netmonster-core-LICENSE.txt
+
+This product also includes Shizuku API / Provider 13.1.5.
+Copyright (c) 2021 RikkaW.
+Shizuku API is licensed under the MIT License.
+https://github.com/RikkaApps/Shizuku-API
+
+The complete MIT License text is included at:
+app/src/main/assets/licenses/shizuku-LICENSE.txt

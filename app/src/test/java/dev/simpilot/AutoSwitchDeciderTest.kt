@@ -112,6 +112,55 @@ class AutoSwitchDeciderTest {
         assertTrue(result.reasons.any { it.contains("SINR") })
     }
 
+    @Test fun narrowBandwidthAndLowCqiAffectOverallVerdict() {
+        val result = AutoSwitchDecider.assess(
+            sample().copy(
+                radioPenalty = 22,
+                radioCapacityScore = 24,
+                radioConfidence = 90,
+                radioReasons = listOf("帯域幅 5.0MHz", "CQI 3"),
+            ),
+            config,
+        )
+        assertEquals(QualityVerdict.DEGRADED, result.verdict)
+        assertEquals(22, result.score)
+        assertTrue(result.reasons.any { it.contains("CQI") })
+    }
+
+    @Test fun theoreticalCapacityAloneDoesNotMoveHealthyConnection() {
+        val current = sample().copy(radioCapacityScore = 30, radioConfidence = 90)
+        val candidate = sample().copy(radioCapacityScore = 75, radioConfidence = 90)
+        assertFalse(
+            AutoSwitchDecider.shouldPreferCandidate(
+                AutoSwitchDecider.assess(current, config),
+                AutoSwitchDecider.assess(candidate, config),
+                current,
+                candidate,
+            )
+        )
+    }
+
+    @Test fun strongRadioHeadroomCanBreakADegradedTie() {
+        val current = sample().copy(
+            radioPenalty = 20,
+            radioCapacityScore = 28,
+            radioConfidence = 90,
+        )
+        val candidate = sample().copy(
+            radioPenalty = 10,
+            radioCapacityScore = 62,
+            radioConfidence = 90,
+        )
+        assertTrue(
+            AutoSwitchDecider.shouldPreferCandidate(
+                AutoSwitchDecider.assess(current, config),
+                AutoSwitchDecider.assess(candidate, config),
+                current,
+                candidate,
+            )
+        )
+    }
+
     @Test fun quotaDoesNotProbeCandidateWithBadRadioQuality() {
         val current = AutoSwitchDecider.assess(sample(), config)
         assertFalse(

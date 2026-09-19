@@ -8,14 +8,16 @@ import java.io.File
 import java.io.FileOutputStream
 import java.time.OffsetDateTime
 import java.time.format.DateTimeFormatter
+import java.util.zip.GZIPOutputStream
 
 object DiagnosticLog {
     private const val TAG = "SimPilotDiag"
     private const val DIRECTORY = "diagnostics"
     private const val CURRENT_FILE = "sim-pilot-current.jsonl"
-    private const val MAX_FILE_BYTES = 2L * 1024L * 1024L
-    private const val MAX_ARCHIVES = 4
+    private const val MAX_FILE_BYTES = 8L * 1024L * 1024L
+    private const val MAX_ARCHIVES = 16
     private val lock = Any()
+    @Volatile private var legacyMigrationDone = false
 
     fun info(
         context: Context,
@@ -59,7 +61,7 @@ object DiagnosticLog {
             put("device", "${Build.MANUFACTURER} ${Build.MODEL}")
             put("android", Build.VERSION.RELEASE)
             put("fields", JSONObject().apply {
-                fields.forEach { (key, value) -> put(key, value ?: JSONObject.NULL) }
+                fields.forEach { (key, value) -> put(key, JSONObject.wrap(value)) }
             })
             error?.let { put("error", it.stackTraceToString()) }
         }.toString() + "\n"
@@ -73,6 +75,10 @@ object DiagnosticLog {
         runCatching {
             synchronized(lock) {
                 val directory = directory(context).apply { mkdirs() }
+                if (!legacyMigrationDone) {
+                    migrateLegacyArchives(directory)
+                    legacyMigrationDone = true
+                }
                 val current = File(directory, CURRENT_FILE)
                 val bytes = line.toByteArray(Charsets.UTF_8)
                 if (current.length() + bytes.size > MAX_FILE_BYTES) rotate(directory, current)
@@ -82,12 +88,36 @@ object DiagnosticLog {
     }
 
     private fun rotate(directory: File, current: File) {
-        File(directory, "sim-pilot.$MAX_ARCHIVES.jsonl").delete()
+        File(directory, "sim-pilot.$MAX_ARCHIVES.jsonl.gz").delete()
         for (index in MAX_ARCHIVES - 1 downTo 1) {
-            val source = File(directory, "sim-pilot.$index.jsonl")
-            if (source.exists()) source.renameTo(File(directory, "sim-pilot.${index + 1}.jsonl"))
+            val source = File(directory, "sim-pilot.$index.jsonl.gz")
+            if (source.exists()) source.renameTo(File(directory, "sim-pilot.${index + 1}.jsonl.gz"))
         }
-        if (current.exists()) current.renameTo(File(directory, "sim-pilot.1.jsonl"))
+        if (current.exists()) {
+            gzip(current, File(directory, "sim-pilot.1.jsonl.gz"))
+            current.delete()
+        }
+    }
+
+    private fun migrateLegacyArchives(directory: File) {
+        for (index in 1..MAX_ARCHIVES) {
+            val legacy = File(directory, "sim-pilot.$index.jsonl")
+            val compressed = File(directory, "sim-pilot.$index.jsonl.gz")
+            if (legacy.exists() && !compressed.exists()) {
+                gzip(legacy, compressed)
+                legacy.delete()
+            }
+        }
+    }
+
+    private fun gzip(source: File, target: File) {
+        val temporary = File(target.parentFile, "${target.name}.tmp")
+        temporary.delete()
+        source.inputStream().buffered().use { input ->
+            GZIPOutputStream(FileOutputStream(temporary)).buffered().use { output -> input.copyTo(output) }
+        }
+        if (target.exists()) target.delete()
+        check(temporary.renameTo(target)) { "Failed to install compressed diagnostic archive ${target.name}" }
     }
 
     private fun deviceContext(context: Context): Context =

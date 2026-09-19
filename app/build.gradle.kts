@@ -11,8 +11,8 @@ android {
         applicationId = "dev.simpilot"
         minSdk = 31
         targetSdk = 37
-        versionCode = 14
-        versionName = "1.7.0"
+        versionCode = 15
+        versionName = "1.8.0"
 
         testInstrumentationRunner = "androidx.test.runner.AndroidJUnitRunner"
     }
@@ -49,3 +49,29 @@ dependencies {
     debugImplementation("androidx.compose.ui:ui-tooling:1.10.5")
     testImplementation("junit:junit:4.13.2")
 }
+
+val verifyLicenseInventory by tasks.registering {
+    group = "verification"
+    description = "Verifies that application and runtime dependency license records are packaged."
+    val requiredFiles = listOf(
+        rootProject.file("LICENSE"),
+        rootProject.file("NOTICE"),
+        rootProject.file("THIRD_PARTY_NOTICES.md"),
+        rootProject.file("licenses/registry.json"),
+        project.file("src/main/assets/licenses/SIM-Pilot-LICENSE.txt"),
+        project.file("src/main/assets/licenses/netmonster-core-LICENSE.txt"),
+        project.file("src/main/assets/licenses/shizuku-LICENSE.txt"),
+    )
+    inputs.files(requiredFiles)
+    doLast {
+        requiredFiles.forEach { licenseFile ->
+            check(licenseFile.isFile && licenseFile.length() > 0L) {
+                "Required license record is missing: ${licenseFile.relativeTo(rootProject.projectDir)}"
+            }
+        }
+        check(project.file("src/main/assets/licenses/netmonster-core-LICENSE.txt").readText().contains("Apache License"))
+        check(project.file("src/main/assets/licenses/shizuku-LICENSE.txt").readText().contains("MIT License"))
+    }
+}
+
+tasks.named("preBuild").configure { dependsOn(verifyLicenseInventory) }

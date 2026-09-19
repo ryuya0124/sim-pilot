@@ -10,7 +10,8 @@ import android.os.SystemClock
 import android.os.UserManager
 import android.provider.Settings
 import androidx.activity.ComponentActivity
-import androidx.activity.compose.BackHandler
+import androidx.activity.BackEventCompat
+import androidx.activity.compose.PredictiveBackHandler
 import androidx.activity.compose.setContent
 import androidx.activity.compose.rememberLauncherForActivityResult
 import androidx.activity.enableEdgeToEdge
@@ -42,6 +43,7 @@ import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.automirrored.rounded.Message
+import androidx.compose.material.icons.automirrored.rounded.OpenInNew
 import androidx.compose.material.icons.rounded.Bolt
 import androidx.compose.material.icons.rounded.Add
 import androidx.compose.material.icons.automirrored.rounded.ArrowBack
@@ -49,6 +51,7 @@ import androidx.compose.material.icons.rounded.CalendarMonth
 import androidx.compose.material.icons.rounded.Delete
 import androidx.compose.material.icons.rounded.CellTower
 import androidx.compose.material.icons.rounded.DataUsage
+import androidx.compose.material.icons.rounded.Home
 import androidx.compose.material.icons.rounded.Phone
 import androidx.compose.material.icons.rounded.Refresh
 import androidx.compose.material.icons.rounded.Settings
@@ -68,7 +71,8 @@ import androidx.compose.material3.HorizontalDivider
 import androidx.compose.material3.Icon
 import androidx.compose.material3.IconButton
 import androidx.compose.material3.MaterialTheme
-import androidx.compose.material3.ModalBottomSheet
+import androidx.compose.material3.NavigationBar
+import androidx.compose.material3.NavigationBarItem
 import androidx.compose.material3.Slider
 import androidx.compose.material3.Surface
 import androidx.compose.material3.Switch
@@ -90,6 +94,7 @@ import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
+import androidx.compose.ui.graphics.graphicsLayer
 import androidx.compose.ui.graphics.Brush
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.graphics.vector.ImageVector
@@ -103,6 +108,7 @@ import androidx.core.content.ContextCompat
 import androidx.core.splashscreen.SplashScreen.Companion.installSplashScreen
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.delay
+import kotlinx.coroutines.flow.collect
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
 import rikka.shizuku.Shizuku
@@ -194,8 +200,9 @@ private fun SimPilotApp(repository: SimRepository) {
     var snapshot by remember { mutableStateOf(AppState.current()) }
     var config by remember { mutableStateOf(AppPreferences(context).load()) }
     var plans by remember { mutableStateOf(AppPreferences(context).loadPlans()) }
-    var showSettings by remember { mutableStateOf(false) }
     var appPage by remember { mutableStateOf(AppPage.HOME) }
+    var appBackProgress by remember { mutableStateOf(0f) }
+    var appBackDirection by remember { mutableStateOf(1f) }
     var radioRefreshing by remember { mutableStateOf(false) }
     var radioRefreshToken by remember { mutableStateOf(0) }
     var busyRole by remember { mutableStateOf<SimRole?>(null) }
@@ -259,7 +266,23 @@ private fun SimPilotApp(repository: SimRepository) {
             val activeSubIds = AppState.current().lines.mapTo(linkedSetOf()) { it.subId }
             if (activeSubIds.isNotEmpty()) {
                 radioRefreshing = true
-                withContext(Dispatchers.IO) { repository.refreshRadioDetails(activeSubIds) }
+                val result = withContext(Dispatchers.IO) { repository.refreshRadioDetails(activeSubIds) }
+                result.onSuccess { refresh ->
+                    val linesBySubId = AppState.current().lines.associateBy { it.subId }
+                    refresh.metrics.forEach { (subId, radio) ->
+                        DiagnosticLog.info(
+                            context,
+                            "radio_page_snapshot",
+                            "無線ページでNetMonster Coreの全取得値を保存",
+                            mapOf(
+                                "source" to "radio_page_5s",
+                                "subId" to subId,
+                                "name" to linesBySubId[subId]?.title,
+                                "radioDetails" to radio.logValue(),
+                            ),
+                        )
+                    }
+                }
                 repository.refresh()
                 radioRefreshing = false
             }
@@ -339,15 +362,17 @@ private fun SimPilotApp(repository: SimRepository) {
         }
     }
 
-    if (appPage == AppPage.RADIO) {
-        BackHandler { appPage = AppPage.HOME }
-        RadioDetailsPage(
-            lines = snapshot.lines,
-            refreshing = radioRefreshing,
-            onBack = { appPage = AppPage.HOME },
-            onRefresh = { radioRefreshToken++ },
-        )
-        return
+    PredictiveBackHandler(enabled = appPage != AppPage.HOME) { events ->
+        try {
+            events.collect { event ->
+                appBackProgress = event.progress
+                appBackDirection = if (event.swipeEdge == BackEventCompat.EDGE_RIGHT) -1f else 1f
+            }
+            appPage = AppPage.HOME
+        } finally {
+            appBackProgress = 0f
+            appBackDirection = 1f
+        }
     }
 
     Box(
@@ -363,113 +388,134 @@ private fun SimPilotApp(repository: SimRepository) {
                 )
             )
     ) {
-            LazyColumn(
-                modifier = Modifier.fillMaxSize(),
-                contentPadding = PaddingValues(
-                    start = 18.dp,
-                    end = 18.dp,
-                    top = WindowInsets.safeDrawing.asPaddingValues().calculateTopPadding() + 10.dp,
-                    bottom = WindowInsets.safeDrawing.asPaddingValues().calculateBottomPadding() + 28.dp,
-                ),
-                verticalArrangement = Arrangement.spacedBy(14.dp),
-            ) {
-                item { Hero(snapshot, config, onSettings = { showSettings = true }) }
-                if (!snapshot.shizukuGranted) {
+        Box(
+            Modifier
+                .fillMaxSize()
+                .graphicsLayer {
+                    translationX = size.width * 0.12f * appBackProgress * appBackDirection
+                    scaleX = 1f - 0.03f * appBackProgress
+                    scaleY = 1f - 0.03f * appBackProgress
+                    alpha = 1f - 0.12f * appBackProgress
+                }
+        ) {
+            when (appPage) {
+                AppPage.HOME -> LazyColumn(
+                    modifier = Modifier.fillMaxSize(),
+                    contentPadding = PaddingValues(
+                        start = 18.dp,
+                        end = 18.dp,
+                        top = WindowInsets.safeDrawing.asPaddingValues().calculateTopPadding() + 10.dp,
+                        bottom = WindowInsets.safeDrawing.asPaddingValues().calculateBottomPadding() + 112.dp,
+                    ),
+                    verticalArrangement = Arrangement.spacedBy(14.dp),
+                ) {
+                    item { Hero(snapshot, config) }
+                    if (!snapshot.shizukuGranted) {
+                        item {
+                            ShizukuCard(
+                                ready = snapshot.shizukuReady,
+                                onRequest = {
+                                    if (snapshot.shizukuReady) ShizukuBridge.requestPermission(REQUEST_SHIZUKU)
+                                    else runCatching {
+                                        val launch = context.packageManager.getLaunchIntentForPackage("af.shizuku.plus.api")
+                                            ?: context.packageManager.getLaunchIntentForPackage("moe.shizuku.privileged.api")
+                                        if (launch != null) context.startActivity(launch)
+                                    }
+                                },
+                            )
+                        }
+                    }
                     item {
-                        ShizukuCard(
-                            ready = snapshot.shizukuReady,
-                            onRequest = {
-                                if (snapshot.shizukuReady) ShizukuBridge.requestPermission(REQUEST_SHIZUKU)
-                                else runCatching {
-                                    val launch = context.packageManager.getLaunchIntentForPackage("af.shizuku.plus.api")
-                                        ?: context.packageManager.getLaunchIntentForPackage("moe.shizuku.privileged.api")
-                                    if (launch != null) context.startActivity(launch)
-                                }
-                            },
+                        AutoCard(
+                            config = config,
+                            running = snapshot.monitorRunning,
+                            backend = snapshot.switchBackend,
+                            onChange = ::persist,
+                            onTest = { MonitorService.start(context, testNow = true, reason = "ui_quality_test") },
                         )
                     }
-                }
-                item {
-                    AutoCard(
-                        config = config,
-                        running = snapshot.monitorRunning,
-                        backend = snapshot.switchBackend,
-                        onChange = ::persist,
-                        onTest = { MonitorService.start(context, testNow = true, reason = "ui_quality_test") },
-                    )
-                }
-                item {
-                    Text("既定SIM", style = MaterialTheme.typography.titleLarge, fontWeight = FontWeight.Bold)
-                    Text(
-                        "データ・通話・メッセージは独立して変更されます",
-                        style = MaterialTheme.typography.bodyMedium,
-                        color = MaterialTheme.colorScheme.onSurfaceVariant,
-                    )
-                }
-                item {
-                    BoxWithConstraints {
-                        val wide = maxWidth >= 720.dp
-                        if (wide) {
-                            Row(horizontalArrangement = Arrangement.spacedBy(12.dp)) {
-                                RoleCard(SimRole.DATA, snapshot.dataSubId, snapshot.lines, busyRole, !snapshot.backendChecked || SimRole.DATA in snapshot.supportedRoles, Modifier.weight(1f), ::switch)
-                                RoleCard(SimRole.VOICE, snapshot.voiceSubId, snapshot.lines, busyRole, !snapshot.backendChecked || SimRole.VOICE in snapshot.supportedRoles, Modifier.weight(1f), ::switch)
-                                RoleCard(SimRole.SMS, snapshot.smsSubId, snapshot.lines, busyRole, !snapshot.backendChecked || SimRole.SMS in snapshot.supportedRoles, Modifier.weight(1f), ::switch)
-                            }
-                        } else {
-                            Column(verticalArrangement = Arrangement.spacedBy(12.dp)) {
-                                RoleCard(SimRole.DATA, snapshot.dataSubId, snapshot.lines, busyRole, !snapshot.backendChecked || SimRole.DATA in snapshot.supportedRoles, Modifier.fillMaxWidth(), ::switch)
-                                RoleCard(SimRole.VOICE, snapshot.voiceSubId, snapshot.lines, busyRole, !snapshot.backendChecked || SimRole.VOICE in snapshot.supportedRoles, Modifier.fillMaxWidth(), ::switch)
-                                RoleCard(SimRole.SMS, snapshot.smsSubId, snapshot.lines, busyRole, !snapshot.backendChecked || SimRole.SMS in snapshot.supportedRoles, Modifier.fillMaxWidth(), ::switch)
+                    item {
+                        Text("既定SIM", style = MaterialTheme.typography.titleLarge, fontWeight = FontWeight.Bold)
+                        Text(
+                            "データ・通話・メッセージは独立して変更されます",
+                            style = MaterialTheme.typography.bodyMedium,
+                            color = MaterialTheme.colorScheme.onSurfaceVariant,
+                        )
+                    }
+                    item {
+                        BoxWithConstraints {
+                            val wide = maxWidth >= 720.dp
+                            if (wide) {
+                                Row(horizontalArrangement = Arrangement.spacedBy(12.dp)) {
+                                    RoleCard(SimRole.DATA, snapshot.dataSubId, snapshot.lines, busyRole, !snapshot.backendChecked || SimRole.DATA in snapshot.supportedRoles, Modifier.weight(1f), ::switch)
+                                    RoleCard(SimRole.VOICE, snapshot.voiceSubId, snapshot.lines, busyRole, !snapshot.backendChecked || SimRole.VOICE in snapshot.supportedRoles, Modifier.weight(1f), ::switch)
+                                    RoleCard(SimRole.SMS, snapshot.smsSubId, snapshot.lines, busyRole, !snapshot.backendChecked || SimRole.SMS in snapshot.supportedRoles, Modifier.weight(1f), ::switch)
+                                }
+                            } else {
+                                Column(verticalArrangement = Arrangement.spacedBy(12.dp)) {
+                                    RoleCard(SimRole.DATA, snapshot.dataSubId, snapshot.lines, busyRole, !snapshot.backendChecked || SimRole.DATA in snapshot.supportedRoles, Modifier.fillMaxWidth(), ::switch)
+                                    RoleCard(SimRole.VOICE, snapshot.voiceSubId, snapshot.lines, busyRole, !snapshot.backendChecked || SimRole.VOICE in snapshot.supportedRoles, Modifier.fillMaxWidth(), ::switch)
+                                    RoleCard(SimRole.SMS, snapshot.smsSubId, snapshot.lines, busyRole, !snapshot.backendChecked || SimRole.SMS in snapshot.supportedRoles, Modifier.fillMaxWidth(), ::switch)
+                                }
                             }
                         }
                     }
+                    item { QualityCard(snapshot) }
+                    item { SimDetails(snapshot.lines, snapshot.dataSubId, snapshot.dataUsage) }
                 }
-                item { QualityCard(snapshot) }
-                item { SimDetails(snapshot.lines, snapshot.dataSubId, snapshot.dataUsage) }
-                item {
-                    FilledTonalButton(
-                        onClick = { appPage = AppPage.RADIO },
-                        modifier = Modifier.fillMaxWidth(),
-                    ) {
-                        Icon(Icons.Rounded.CellTower, null)
-                        Spacer(Modifier.width(8.dp))
-                        Text("無線詳細を表示")
-                    }
-                }
-                item {
-                    FilledTonalButton(
-                        onClick = {
-                            context.startActivity(Intent(Settings.ACTION_IGNORE_BATTERY_OPTIMIZATION_SETTINGS))
-                        },
-                        modifier = Modifier.fillMaxWidth(),
-                    ) {
-                        Icon(Icons.Rounded.Bolt, null)
-                        Spacer(Modifier.width(8.dp))
-                        Text("バッテリー最適化を確認")
-                    }
-                }
+                AppPage.RADIO -> RadioDetailsPage(
+                    lines = snapshot.lines,
+                    refreshing = radioRefreshing,
+                    onRefresh = { radioRefreshToken++ },
+                )
+                AppPage.SETTINGS -> SettingsPageScreen(
+                    config = config,
+                    lines = snapshot.lines,
+                    dataSubId = snapshot.dataSubId,
+                    voiceSubId = snapshot.voiceSubId,
+                    smsSubId = snapshot.smsSubId,
+                    plans = plans,
+                    onChange = ::persist,
+                    onPlansChange = ::persistPlans,
+                )
             }
-    }
-
-    if (showSettings) {
-        SettingsSheet(
-            config = config,
-            lines = snapshot.lines,
-            dataSubId = snapshot.dataSubId,
-            voiceSubId = snapshot.voiceSubId,
-            smsSubId = snapshot.smsSubId,
-            plans = plans,
-            onDismiss = { showSettings = false },
-            onChange = ::persist,
-            onPlansChange = ::persistPlans,
+        }
+        AppNavigationBar(
+            selected = appPage,
+            onSelected = { appPage = it },
+            modifier = Modifier.align(Alignment.BottomCenter),
         )
     }
 }
 
-private enum class AppPage { HOME, RADIO }
+private enum class AppPage { HOME, RADIO, SETTINGS }
 
 @Composable
-private fun Hero(snapshot: AppSnapshot, config: MonitorConfig, onSettings: () -> Unit) {
+private fun AppNavigationBar(selected: AppPage, onSelected: (AppPage) -> Unit, modifier: Modifier = Modifier) {
+    NavigationBar(modifier = modifier.fillMaxWidth(), tonalElevation = 6.dp) {
+        NavigationBarItem(
+            selected = selected == AppPage.HOME,
+            onClick = { onSelected(AppPage.HOME) },
+            icon = { Icon(Icons.Rounded.Home, null) },
+            label = { Text("ホーム") },
+        )
+        NavigationBarItem(
+            selected = selected == AppPage.RADIO,
+            onClick = { onSelected(AppPage.RADIO) },
+            icon = { Icon(Icons.Rounded.CellTower, null) },
+            label = { Text("無線") },
+        )
+        NavigationBarItem(
+            selected = selected == AppPage.SETTINGS,
+            onClick = { onSelected(AppPage.SETTINGS) },
+            icon = { Icon(Icons.Rounded.Settings, null) },
+            label = { Text("設定") },
+        )
+    }
+}
+
+@Composable
+private fun Hero(snapshot: AppSnapshot, config: MonitorConfig) {
     val primary = MaterialTheme.colorScheme.primary
     val secondary = MaterialTheme.colorScheme.tertiary
     Card(
@@ -493,7 +539,6 @@ private fun Hero(snapshot: AppSnapshot, config: MonitorConfig, onSettings: () ->
                         Text("SIM Pilot", color = Color.White, fontSize = 26.sp, fontWeight = FontWeight.Black)
                         Text("DSDV SMART FAILOVER", color = Color.White.copy(alpha = .76f), fontSize = 11.sp, letterSpacing = 1.7.sp)
                     }
-                    IconButton(onClick = onSettings) { Icon(Icons.Rounded.Settings, "設定", tint = Color.White) }
                 }
                 Spacer(Modifier.height(24.dp))
                 Row(verticalAlignment = Alignment.CenterVertically) {
@@ -712,7 +757,6 @@ private fun signalText(level: Int) = if (level < 0) "取得中" else "電波 $le
 private fun RadioDetailsPage(
     lines: List<SimLine>,
     refreshing: Boolean,
-    onBack: () -> Unit,
     onRefresh: () -> Unit,
 ) {
     var selectedSubId by remember { mutableStateOf(lines.firstOrNull()?.subId ?: -1) }
@@ -726,16 +770,12 @@ private fun RadioDetailsPage(
                 start = 18.dp,
                 end = 18.dp,
                 top = WindowInsets.safeDrawing.asPaddingValues().calculateTopPadding() + 8.dp,
-                bottom = WindowInsets.safeDrawing.asPaddingValues().calculateBottomPadding() + 28.dp,
+                bottom = WindowInsets.safeDrawing.asPaddingValues().calculateBottomPadding() + 112.dp,
             ),
             verticalArrangement = Arrangement.spacedBy(14.dp),
         ) {
             item {
                 Row(verticalAlignment = Alignment.CenterVertically) {
-                    IconButton(onClick = onBack) {
-                        Icon(Icons.AutoMirrored.Rounded.ArrowBack, "ホームへ戻る")
-                    }
-                    Spacer(Modifier.width(4.dp))
                     Column(Modifier.weight(1f)) {
                         Text("無線状態", style = MaterialTheme.typography.headlineMedium, fontWeight = FontWeight.Bold)
                         Text(
@@ -813,6 +853,11 @@ private fun RadioLineDetails(line: SimLine) {
             RadioDetailRow("セル構成", "Primary ${if (radio.primaryConnected) 1 else 0} · Secondary ${radio.secondaryCellCount} · Neighbor ${radio.neighboringCellCount}")
             RadioDetailRow("代表バンド", listOfNotNull(radio.bandLabel, radio.channelNumber?.let { "CH $it" }).joinToString(" · ").ifBlank { "—" })
             RadioDetailRow("品質", "RSRP ${radio.rsrpDbm?.let { "%.1f".format(it) } ?: "—"} · RSRQ ${radio.rsrqDb?.let { "%.1f".format(it) } ?: "—"} · SINR ${radio.sinrDb?.let { "%.1f".format(it) } ?: "—"}")
+            val intelligence = RadioIntelligence.assess(radio)
+            RadioDetailRow("無線評価", "減点 ${intelligence.penalty} · 余力 ${intelligence.capacityScore} · 信頼度 ${intelligence.confidence}%")
+            if (intelligence.reasons.isNotEmpty()) {
+                RadioDetailRow("評価理由", intelligence.reasons.joinToString(" · "))
+            }
             if (radio.aggregatedBands.isNotEmpty()) {
                 RadioDetailRow("CA", radio.aggregatedBands.joinToString(" + "))
             }
@@ -871,21 +916,51 @@ private fun RadioDetailRow(label: String, value: String) {
 
 @OptIn(ExperimentalMaterial3Api::class)
 @Composable
-private fun SettingsSheet(
+private fun SettingsPageScreen(
     config: MonitorConfig,
     lines: List<SimLine>,
     dataSubId: Int,
     voiceSubId: Int,
     smsSubId: Int,
     plans: List<SimPlanConfig>,
-    onDismiss: () -> Unit,
     onChange: (MonitorConfig) -> Unit,
     onPlansChange: (List<SimPlanConfig>) -> Unit,
 ) {
+    val context = LocalContext.current
     var page by remember { mutableStateOf(SettingsPage.HOME) }
-    ModalBottomSheet(onDismissRequest = onDismiss) {
+    var backProgress by remember { mutableStateOf(0f) }
+    var backDirection by remember { mutableStateOf(1f) }
+    PredictiveBackHandler(enabled = page != SettingsPage.HOME) { events ->
+        try {
+            events.collect { event ->
+                backProgress = event.progress
+                backDirection = if (event.swipeEdge == BackEventCompat.EDGE_RIGHT) -1f else 1f
+            }
+            page = when (page) {
+                SettingsPage.APP_LICENSE,
+                SettingsPage.NETMONSTER_LICENSE,
+                SettingsPage.SHIZUKU_LICENSE -> SettingsPage.LICENSES
+                else -> SettingsPage.HOME
+            }
+        } finally {
+            backProgress = 0f
+            backDirection = 1f
+        }
+    }
+    Surface(Modifier.fillMaxSize(), color = MaterialTheme.colorScheme.surface) {
         LazyColumn(
-            contentPadding = PaddingValues(start = 22.dp, end = 22.dp, bottom = 32.dp),
+            modifier = Modifier.graphicsLayer {
+                translationX = size.width * 0.16f * backProgress * backDirection
+                scaleX = 1f - 0.025f * backProgress
+                scaleY = 1f - 0.025f * backProgress
+                alpha = 1f - 0.14f * backProgress
+            },
+            contentPadding = PaddingValues(
+                start = 18.dp,
+                end = 18.dp,
+                top = WindowInsets.safeDrawing.asPaddingValues().calculateTopPadding() + 12.dp,
+                bottom = WindowInsets.safeDrawing.asPaddingValues().calculateBottomPadding() + 112.dp,
+            ),
             verticalArrangement = Arrangement.spacedBy(18.dp),
         ) {
             when (page) {
@@ -904,6 +979,16 @@ private fun SettingsSheet(
                     item {
                         SettingsCategory(Icons.Rounded.DataUsage, "データプラン", "SIM別容量・期間・povoトッピング") {
                             page = SettingsPage.DATA_PLANS
+                        }
+                    }
+                    item {
+                        SettingsCategory(Icons.Rounded.Bolt, "バッテリー最適化", "バックグラウンド監視の制限を確認") {
+                            context.startActivity(Intent(Settings.ACTION_IGNORE_BATTERY_OPTIMIZATION_SETTINGS))
+                        }
+                    }
+                    item {
+                        SettingsCategory(Icons.Rounded.Shield, "ライセンス", "SIM Pilotと第三者ライブラリ") {
+                            page = SettingsPage.LICENSES
                         }
                     }
                 }
@@ -962,12 +1047,117 @@ private fun SettingsSheet(
                     item { SettingsPageHeader("データプラン") { page = SettingsPage.HOME } }
                     item { DataPlanSettings(lines = lines, plans = plans, onPlansChange = onPlansChange) }
                 }
+                SettingsPage.LICENSES -> {
+                    item { SettingsPageHeader("ライセンス") { page = SettingsPage.HOME } }
+                    item {
+                        LicenseOverview(
+                            onAppLicense = { page = SettingsPage.APP_LICENSE },
+                            onNetMonsterLicense = { page = SettingsPage.NETMONSTER_LICENSE },
+                            onShizukuLicense = { page = SettingsPage.SHIZUKU_LICENSE },
+                        )
+                    }
+                }
+                SettingsPage.APP_LICENSE -> {
+                    item { SettingsPageHeader("SIM Pilotライセンス") { page = SettingsPage.LICENSES } }
+                    item { LicenseText("licenses/SIM-Pilot-LICENSE.txt") }
+                }
+                SettingsPage.NETMONSTER_LICENSE -> {
+                    item { SettingsPageHeader("NetMonster Core") { page = SettingsPage.LICENSES } }
+                    item { LicenseText("licenses/netmonster-core-LICENSE.txt") }
+                }
+                SettingsPage.SHIZUKU_LICENSE -> {
+                    item { SettingsPageHeader("Shizuku API") { page = SettingsPage.LICENSES } }
+                    item { LicenseText("licenses/shizuku-LICENSE.txt") }
+                }
             }
         }
     }
 }
 
-private enum class SettingsPage { HOME, WIFI, QUALITY, DATA_PLANS }
+private enum class SettingsPage {
+    HOME,
+    WIFI,
+    QUALITY,
+    DATA_PLANS,
+    LICENSES,
+    APP_LICENSE,
+    NETMONSTER_LICENSE,
+    SHIZUKU_LICENSE,
+}
+
+@Composable
+private fun LicenseOverview(
+    onAppLicense: () -> Unit,
+    onNetMonsterLicense: () -> Unit,
+    onShizukuLicense: () -> Unit,
+) {
+    val context = LocalContext.current
+    Column(verticalArrangement = Arrangement.spacedBy(12.dp)) {
+        Surface(shape = RoundedCornerShape(20.dp), color = MaterialTheme.colorScheme.surfaceContainerHigh) {
+            Column(Modifier.padding(16.dp), verticalArrangement = Arrangement.spacedBy(8.dp)) {
+                Text("SIM Pilot ${BuildConfig.VERSION_NAME}", style = MaterialTheme.typography.titleLarge, fontWeight = FontWeight.Bold)
+                Text("Copyright © 2026 ryuya0124 · All rights reserved", style = MaterialTheme.typography.bodyMedium)
+                Text("SIM Pilot本体は権利留保です。第三者コンポーネントにはそれぞれのライセンスが適用されます。", style = MaterialTheme.typography.bodySmall)
+                FilledTonalButton(onClick = onAppLicense, modifier = Modifier.fillMaxWidth()) { Text("SIM Pilotの全文を表示") }
+            }
+        }
+        Surface(shape = RoundedCornerShape(20.dp), color = MaterialTheme.colorScheme.surfaceContainerHigh) {
+            Column(Modifier.padding(16.dp), verticalArrangement = Arrangement.spacedBy(8.dp)) {
+                Text("NetMonster Core 1.3.0", style = MaterialTheme.typography.titleLarge, fontWeight = FontWeight.Bold)
+                Text("Copyright 2019 Michal Mroček", style = MaterialTheme.typography.bodyMedium)
+                Text("Apache License 2.0", color = MaterialTheme.colorScheme.primary, fontWeight = FontWeight.Bold)
+                Text("RIL値の検証・統合、セル情報と無線パラメータの取得に使用しています。", style = MaterialTheme.typography.bodySmall)
+                FilledTonalButton(onClick = onNetMonsterLicense, modifier = Modifier.fillMaxWidth()) { Text("Apache 2.0全文を表示") }
+                TextButton(
+                    onClick = { context.startActivity(Intent(Intent.ACTION_VIEW, Uri.parse("https://github.com/mroczis/netmonster-core"))) },
+                    modifier = Modifier.fillMaxWidth(),
+                ) {
+                    Icon(Icons.AutoMirrored.Rounded.OpenInNew, null, Modifier.size(18.dp))
+                    Spacer(Modifier.width(8.dp))
+                    Text("公式リポジトリ")
+                }
+            }
+        }
+        Surface(shape = RoundedCornerShape(20.dp), color = MaterialTheme.colorScheme.surfaceContainerHigh) {
+            Column(Modifier.padding(16.dp), verticalArrangement = Arrangement.spacedBy(8.dp)) {
+                Text("Shizuku API / Provider 13.1.5", style = MaterialTheme.typography.titleLarge, fontWeight = FontWeight.Bold)
+                Text("Copyright © 2021 RikkaW", style = MaterialTheme.typography.bodyMedium)
+                Text("MIT License", color = MaterialTheme.colorScheme.primary, fontWeight = FontWeight.Bold)
+                FilledTonalButton(onClick = onShizukuLicense, modifier = Modifier.fillMaxWidth()) { Text("MIT License全文を表示") }
+                TextButton(
+                    onClick = { context.startActivity(Intent(Intent.ACTION_VIEW, Uri.parse("https://github.com/RikkaApps/Shizuku-API"))) },
+                    modifier = Modifier.fillMaxWidth(),
+                ) {
+                    Icon(Icons.AutoMirrored.Rounded.OpenInNew, null, Modifier.size(18.dp))
+                    Spacer(Modifier.width(8.dp))
+                    Text("公式リポジトリ")
+                }
+            }
+        }
+        Text(
+            "AndroidX / Jetpack ComposeはApache License 2.0です。全依存関係の帰属情報はソース配布物のTHIRD_PARTY_NOTICES.mdで管理しています。",
+            style = MaterialTheme.typography.bodySmall,
+            color = MaterialTheme.colorScheme.onSurfaceVariant,
+        )
+    }
+}
+
+@Composable
+private fun LicenseText(assetPath: String) {
+    val context = LocalContext.current
+    val text = remember(assetPath) {
+        runCatching { context.assets.open(assetPath).bufferedReader().use { it.readText() } }
+            .getOrElse { "ライセンス本文を読み込めませんでした。" }
+    }
+    Surface(shape = RoundedCornerShape(18.dp), color = MaterialTheme.colorScheme.surfaceContainerHigh) {
+        Text(
+            text,
+            Modifier.padding(16.dp),
+            style = MaterialTheme.typography.bodySmall,
+            color = MaterialTheme.colorScheme.onSurfaceVariant,
+        )
+    }
+}
 
 @Composable
 private fun SettingsPageHeader(title: String, onBack: () -> Unit) {

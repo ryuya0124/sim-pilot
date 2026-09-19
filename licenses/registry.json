@@ -1,0 +1,31 @@
+{
+  "application": {
+    "name": "SIM Pilot",
+    "version": "1.8.0",
+    "license": "Proprietary / All rights reserved",
+    "licenseFile": "LICENSE"
+  },
+  "runtimeDependencies": [
+    {
+      "name": "NetMonster Core",
+      "coordinate": "app.netmonster:core:1.3.0",
+      "license": "Apache-2.0",
+      "copyright": "Copyright 2019 Michal Mroček",
+      "licenseFile": "app/src/main/assets/licenses/netmonster-core-LICENSE.txt"
+    },
+    {
+      "name": "Shizuku API / Provider",
+      "coordinate": "dev.rikka.shizuku:api:13.1.5; dev.rikka.shizuku:provider:13.1.5",
+      "license": "MIT",
+      "copyright": "Copyright (c) 2021 RikkaW",
+      "licenseFile": "app/src/main/assets/licenses/shizuku-LICENSE.txt"
+    },
+    {
+      "name": "AndroidX / Jetpack Compose",
+      "coordinate": "See app/build.gradle.kts",
+      "license": "Apache-2.0",
+      "copyright": "The Android Open Source Project contributors",
+      "licenseFile": "app/src/main/assets/licenses/netmonster-core-LICENSE.txt"
+    }
+  ]
+}

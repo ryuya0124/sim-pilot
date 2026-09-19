@@ -63,6 +63,31 @@ data class RadioMetrics(
             val prefix = if (technology.startsWith("5G")) "n" else "B"
             "$prefix$number"
         } ?: bandName
+
+    fun logValue(): Map<String, Any?> = mapOf(
+        "technology" to technology,
+        "primaryConnected" to primaryConnected,
+        "servingCellCount" to servingCellCount,
+        "neighboringCellCount" to neighboringCellCount,
+        "secondaryCellCount" to secondaryCellCount,
+        "bandNumber" to bandNumber,
+        "bandName" to bandName,
+        "channelNumber" to channelNumber,
+        "aggregatedBands" to aggregatedBands,
+        "bandwidthKhz" to bandwidthKhz,
+        "referenceDbm" to referenceDbm,
+        "rssiDbm" to rssiDbm,
+        "rsrpDbm" to rsrpDbm,
+        "rsrqDb" to rsrqDb,
+        "sinrDb" to sinrDb,
+        "cqi" to cqi,
+        "timingAdvance" to timingAdvance,
+        "pci" to pci,
+        "areaCode" to areaCode,
+        "cellId" to cellId,
+        "observedAtElapsed" to observedAtElapsed,
+        "cells" to cells.map(RadioCellObservation::logValue),
+    )
 }
 
 data class RadioCellObservation(

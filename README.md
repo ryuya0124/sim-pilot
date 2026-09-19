@@ -10,6 +10,7 @@ Galaxy S26 Ultra（SM-S948Q / One UI 8.5）を最優先の検証端末としつ�
 - NetMonster CoreでRIL値を検証・統合し、Primary / Secondary / Neighborの全セルをSIM別に保持
 - PLMN、MCC/MNC、国コード、バンド、チャネル、ARFCN、帯域幅、CA、各方式のセル識別子を観測
 - LTEのRSSI/RSRP/RSRQ/SNR/CQI/Timing Advance、NRのSS/CSI RSRP・RSRQ・SINR、旧世代方式のRSCP/EcNo/BER/CDMA・EVDO値など、端末から得られた信号項目を方式別に表示・記録
+- CQI、帯域幅、CA、通信方式、Primary状態、Servingセルの切替頻度を保守的な無線インテリジェンスへ変換し、実測値と組み合わせて判定
 - 電波レベル・在圏状態・通信方式・データ接続・通話状態・既定ネットワーク・SIM構成の変化を受けて即時再評価
 - `-114 dBm`以下を既定の弱電波として減点し、品質低下中は3秒間隔で連続判定
 - 一度の小さな疎通成功では悪化履歴を全消去せず、回復に応じて段階的に減衰
@@ -34,6 +35,8 @@ Galaxy S26 Ultra（SM-S948Q / One UI 8.5）を最優先の検証端末としつ�
 - 実機の `ISub` Binder Stubからデータ・通話・SMSのtransactionを動的解決し、OEM／Androidバージョン差へ追従
 - 切替方式を検出できない役割は操作を無効化し、誤ったBinder呼び出しを防止
 - Material Design 3、動的カラー、edge-to-edge、画面幅に応じた適応レイアウト
+- 画面下部の常設タブで「ホーム」「無線」「設定」を直接切替。ホーム上の画面遷移ボタンを整理
+- Androidの予測型「戻る」に対応し、設定の子ページと各トップページをジェスチャー進行に合わせて遷移
 - 設定ホームから「通信品質」「Wi-Fi接続時」「データプラン」を独立ページとして編集
 - SIM別の月次プラン、固定期間プラン、povo向け複数トッピングと手動残量に対応
 
@@ -70,7 +73,7 @@ Android 13以降では通知権限を宣言・要求しないため、監視通�
 
 ## 診断ログ
 
-最大約10MB（2MB×現在分＋4世代）のJSON Lines形式で、Direct Boot対応のアプリ専用領域に保存します。電話番号、ICCID、IMSI、IMEIは記録しません。各監視周期には通信経路、SIM名／ID、dBm、RSRP/RSRQ/SINR、周波数帯・チャネル・CA、品質スコアと内訳、両SIMの比較値、残容量、判定、切替しなかった理由、Shizuku状態を含みます。全セルの詳細は構成変更時および60秒ごとに記録し、容量を浪費せずハンドオーバーも追跡します。SIM Pilotが要求した変更は `app/ui_manual`、`app/auto_failover`、`app/comparison_probe`、`app/comparison_revert`、`app/wifi_restore`、それ以外の変更は `external_user_or_system` と記録します。
+現在ログは最大8MBのJSON Lines、過去ログは最大16世代のgzip圧縮JSON Linesとして、Direct Boot対応のアプリ専用領域に保存します。各NetMonster観測でPrimary / Secondary / Neighbor全セルの全取得値を間引かず記録し、無線ページ表示中の5秒観測も保存します。電話番号、ICCID、IMSI、IMEIは記録しません。各監視周期には通信経路、SIM名／ID、dBm、RSRP/RSRQ/SINR、CQI、帯域幅、CA、セル識別情報、無線評価、品質スコアと内訳、両SIMの比較値、残容量、判定、切替しなかった理由、Shizuku状態を含みます。SIM Pilotが要求した変更は `app/ui_manual`、`app/auto_failover`、`app/comparison_probe`、`app/comparison_revert`、`app/wifi_restore`、それ以外の変更は `external_user_or_system` と記録します。
 
 接続中の端末からログと現在のシステム状態をまとめて取得できます。
 
@@ -117,4 +120,10 @@ SIM別実績はShizukuのshell権限からAndroidのネットワーク統計を�
 
 ## サードパーティ
 
-- [NetMonster Core](https://github.com/mroczis/netmonster-core) 1.3.0 — Apache License 2.0。Android Telephony/RIL情報の検証・統合とLTE/NR無線パラメータ取得に使用します。
+- [NetMonster Core](https://github.com/mroczis/netmonster-core) 1.3.0 — Copyright 2019 Michal Mroček、Apache License 2.0。Android Telephony/RIL情報の検証・統合と無線パラメータ取得に使用します。ライセンス全文をAPKとソースに同梱し、アプリの「設定 → ライセンス」から確認できます。
+
+## ライセンス管理
+
+SIM Pilot本体はCopyright © 2026 ryuya0124、All rights reservedです。公開リポジトリを閲覧できること自体は、複製・変更・再配布の許諾を意味しません。詳細は`LICENSE`を参照してください。
+
+第三者コンポーネントは`THIRD_PARTY_NOTICES.md`でバージョン・著作権者・ライセンス・配布元を管理します。依存関係を追加または更新する際は、上流ライセンスの確認、通知の更新、必要なライセンス本文のAPK同梱を必須とします。

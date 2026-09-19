@@ -61,8 +61,9 @@ class MonitorService : Service() {
     private var lastSpeedProbeAtElapsed = 0L
     private var lastPeriodicAlternateProbeAtElapsed = 0L
     private var lastRadioRefreshAtElapsed = 0L
-    private var lastDetailedRadioLogAtElapsed = 0L
     private var lastRadioTopology: Map<Int, String> = emptyMap()
+    @Volatile private var lastServingTopology: Map<Int, String> = emptyMap()
+    private val servingCellChangeHistory = ConcurrentHashMap<Int, java.util.ArrayDeque<Long>>()
     private val alternateProbeCache = mutableMapOf<Int, TimedQualitySample>()
     private val usageCache = ConcurrentHashMap<Int, TimedUsage>()
     private val lastComparisonTrialAt = mutableMapOf<Int, Long>()
@@ -563,10 +564,14 @@ class MonitorService : Service() {
         val weakSignal = current.dbm?.let { it <= config.weakSignalDbm }
             ?: (current.signalLevel in 0..1)
         val nowElapsed = SystemClock.elapsedRealtime()
+        val currentIntelligence = RadioIntelligence.assess(
+            current.radio,
+            recentServingCellChanges(current.subId, nowElapsed),
+        )
         val rapidSpeedDue = nowElapsed - lastSpeedProbeAtElapsed >= RAPID_SPEED_MIN_GAP_MS
         val radioQualityPoor = current.radio?.let {
             AutoSwitchDecider.radioQualityPenalty(it.rsrqDb, it.sinrDb) >= 12
-        } == true
+        } == true || currentIntelligence.poor
         val periodicSpeedDue = nowElapsed - lastSpeedProbeAtElapsed >=
             maxOf(config.intervalSeconds * 10_000L, MIN_PERIODIC_SPEED_INTERVAL_MS)
         val shouldMeasureSpeed = forceDeepProbe ||
@@ -593,6 +598,10 @@ class MonitorService : Service() {
             speedKbps = speed,
             rsrqDb = current.radio?.rsrqDb,
             sinrDb = current.radio?.sinrDb,
+            radioPenalty = currentIntelligence.penalty,
+            radioCapacityScore = currentIntelligence.capacityScore.takeIf { currentIntelligence.confidence > 0 },
+            radioConfidence = currentIntelligence.confidence,
+            radioReasons = currentIntelligence.reasons,
         )
         val assessment = AutoSwitchDecider.assess(sample, config)
         val verdict = assessment.verdict
@@ -649,6 +658,10 @@ class MonitorService : Service() {
                 "wakeToCycleStartMs" to wakeToCycleStartMs,
                 "latencyProbeElapsedMs" to latencyProbeElapsedMs,
                 "speedProbeElapsedMs" to speedProbeElapsedMs,
+                "radioIntelligencePenalty" to sample.radioPenalty,
+                "radioCapacityScore" to sample.radioCapacityScore,
+                "radioConfidence" to sample.radioConfidence,
+                "servingCellChanges2m" to currentIntelligence.recentServingCellChanges,
                 "cycleElapsedMs" to (SystemClock.elapsedRealtime() - cycleStartedAtElapsed),
                 "wakeToPrimaryResultMs" to wakeStartedAtElapsed?.let {
                     (SystemClock.elapsedRealtime() - it).coerceAtLeast(0L)
@@ -724,6 +737,13 @@ class MonitorService : Service() {
                 "alternateLatencyMs" to candidateProbe?.latencyMs,
                 "alternateSpeedKbps" to candidateProbe?.speedKbps,
                 "alternateScore" to candidateAssessment?.score,
+                "radioIntelligencePenalty" to sample.radioPenalty,
+                "radioCapacityScore" to sample.radioCapacityScore,
+                "radioConfidence" to sample.radioConfidence,
+                "servingCellChanges2m" to currentIntelligence.recentServingCellChanges,
+                "alternateRadioIntelligencePenalty" to candidateProbe?.radioPenalty,
+                "alternateRadioCapacityScore" to candidateProbe?.radioCapacityScore,
+                "alternateRadioConfidence" to candidateProbe?.radioConfidence,
                 "candidatePreferred" to candidatePreferred,
                 "quotaAdvantage" to quotaAdvantage,
                 "quotaTrialEligible" to quotaTrialEligible,
@@ -1088,6 +1108,10 @@ class MonitorService : Service() {
         val latency = network?.let { latencyProbe(it, allowDefaultFallback = false) }
         val speed = network?.let { speedProbe(it, allowDefaultFallback = false) }
         requested?.release()
+        val intelligence = RadioIntelligence.assess(
+            line.radio,
+            recentServingCellChanges(line.subId, SystemClock.elapsedRealtime()),
+        )
         val sample = QualitySample(
             inService = line.inService,
             serviceStateKnown = line.serviceStateKnown,
@@ -1098,6 +1122,10 @@ class MonitorService : Service() {
             speedKbps = speed,
             rsrqDb = line.radio?.rsrqDb,
             sinrDb = line.radio?.sinrDb,
+            radioPenalty = intelligence.penalty,
+            radioCapacityScore = intelligence.capacityScore.takeIf { intelligence.confidence > 0 },
+            radioConfidence = intelligence.confidence,
+            radioReasons = intelligence.reasons,
         )
         alternateProbeCache[line.subId] = TimedQualitySample(sample, System.currentTimeMillis())
         DiagnosticLog.info(
@@ -1114,6 +1142,10 @@ class MonitorService : Service() {
                 "latencyMs" to latency,
                 "speedKbps" to speed,
                 "score" to AutoSwitchDecider.assess(sample, config).score,
+                "radioIntelligencePenalty" to intelligence.penalty,
+                "radioCapacityScore" to intelligence.capacityScore,
+                "radioConfidence" to intelligence.confidence,
+                "servingCellChanges2m" to intelligence.recentServingCellChanges,
             ) + radioLogFields("radio", line.radio),
         )
         return sample
@@ -1253,6 +1285,10 @@ class MonitorService : Service() {
             )
             return ComparisonResult.ABORTED
         }
+        val candidateIntelligence = RadioIntelligence.assess(
+            refreshedCandidate.radio,
+            recentServingCellChanges(refreshedCandidate.subId, SystemClock.elapsedRealtime()),
+        )
         val candidateSample = QualitySample(
             inService = refreshedCandidate.inService,
             serviceStateKnown = refreshedCandidate.serviceStateKnown,
@@ -1263,6 +1299,10 @@ class MonitorService : Service() {
             speedKbps = speed,
             rsrqDb = refreshedCandidate.radio?.rsrqDb,
             sinrDb = refreshedCandidate.radio?.sinrDb,
+            radioPenalty = candidateIntelligence.penalty,
+            radioCapacityScore = candidateIntelligence.capacityScore.takeIf { candidateIntelligence.confidence > 0 },
+            radioConfidence = candidateIntelligence.confidence,
+            radioReasons = candidateIntelligence.reasons,
         )
         val candidateAssessment = AutoSwitchDecider.assess(candidateSample, config)
         alternateProbeCache[candidate.subId] = TimedQualitySample(candidateSample, System.currentTimeMillis())
@@ -1288,6 +1328,10 @@ class MonitorService : Service() {
                 "candidateSpeedKbps" to candidateSample.speedKbps,
                 "currentScore" to currentAssessment.score,
                 "candidateScore" to candidateAssessment.score,
+                "currentRadioCapacityScore" to currentSample.radioCapacityScore,
+                "candidateRadioCapacityScore" to candidateSample.radioCapacityScore,
+                "currentRadioIntelligencePenalty" to currentSample.radioPenalty,
+                "candidateRadioIntelligencePenalty" to candidateSample.radioPenalty,
                 "quotaAdvantage" to quotaAdvantage,
                 "keepCandidate" to keep,
                 "reason" to reason,
@@ -1354,23 +1398,26 @@ class MonitorService : Service() {
                         val topologyChanged = topology != lastRadioTopology
                         lastRadioTopology = topology
                         val logNow = SystemClock.elapsedRealtime()
-                        if (topologyChanged || logNow - lastDetailedRadioLogAtElapsed >= DETAILED_RADIO_LOG_INTERVAL_MS) {
-                            lastDetailedRadioLogAtElapsed = logNow
-                            result.metrics.forEach { (subId, radio) ->
-                                val line = refreshedLines.firstOrNull { it.subId == subId }
-                                DiagnosticLog.info(
-                                    this@MonitorService,
-                                    "radio_snapshot",
-                                    "NetMonster Coreで無線状態を観測",
-                                    mapOf(
-                                        "subId" to subId,
-                                        "name" to line?.title,
-                                        "durationMs" to (SystemClock.elapsedRealtime() - started),
-                                        "topologyChanged" to topologyChanged,
-                                        "radioCells" to radio.cells.map(RadioCellObservation::logValue),
-                                    ) + radioLogFields("radio", radio),
-                                )
-                            }
+                        recordServingTopologyChanges(
+                            result.metrics.mapValues { (_, radio) -> radio.servingTopologyKey() },
+                            logNow,
+                        )
+                        result.metrics.forEach { (subId, radio) ->
+                            val line = refreshedLines.firstOrNull { it.subId == subId }
+                            DiagnosticLog.info(
+                                this@MonitorService,
+                                "radio_snapshot",
+                                "NetMonster Coreの全取得値を保存",
+                                mapOf(
+                                    "source" to "monitor_10s",
+                                    "subId" to subId,
+                                    "name" to line?.title,
+                                    "durationMs" to (SystemClock.elapsedRealtime() - started),
+                                    "topologyChanged" to topologyChanged,
+                                    "servingCellChanges2m" to recentServingCellChanges(subId, logNow),
+                                    "radioDetails" to radio.logValue(),
+                                ) + radioLogFields("radio", radio),
+                            )
                         }
                         if (result.materiallyChanged) scheduleNext(250)
                     }
@@ -1391,6 +1438,7 @@ class MonitorService : Service() {
 
     private fun radioLogFields(prefix: String, radio: RadioMetrics?): Map<String, Any?> {
         if (radio == null) return mapOf("${prefix}Available" to false)
+        val intelligence = RadioIntelligence.assess(radio)
         return mapOf(
             "${prefix}Available" to true,
             "${prefix}Technology" to radio.technology,
@@ -1413,6 +1461,10 @@ class MonitorService : Service() {
             "${prefix}Pci" to radio.pci,
             "${prefix}AreaCode" to radio.areaCode,
             "${prefix}CellId" to radio.cellId,
+            "${prefix}IntelligencePenalty" to intelligence.penalty,
+            "${prefix}CapacityScore" to intelligence.capacityScore,
+            "${prefix}Confidence" to intelligence.confidence,
+            "${prefix}IntelligenceReasons" to intelligence.reasons.joinToString(", "),
             "${prefix}ObservedAtElapsed" to radio.observedAtElapsed,
         )
     }
@@ -1425,6 +1477,46 @@ class MonitorService : Service() {
             cell.band.joinToString(",") { "${it.key}=${it.value}" },
             cell.identity.joinToString(",") { "${it.key}=${it.value}" },
         ).joinToString(";")
+    }
+
+    private fun RadioMetrics.servingTopologyKey(): String {
+        val primaryCells = cells.filter { it.connection == "Primary" }
+        if (primaryCells.isEmpty()) return "$technology;$bandLabel;$cellId;$areaCode;$pci"
+        return primaryCells.joinToString("|") { cell ->
+            listOf(
+                cell.technology,
+                cell.band.joinToString(",") { "${it.key}=${it.value}" },
+                cell.identity.joinToString(",") { "${it.key}=${it.value}" },
+            ).joinToString(";")
+        }
+    }
+
+    private fun recordServingTopologyChanges(next: Map<Int, String>, now: Long) {
+        val previous = lastServingTopology
+        lastServingTopology = next
+        next.forEach { (subId, key) ->
+            val old = previous[subId]
+            if (old != null && old != key) {
+                val history = servingCellChangeHistory.computeIfAbsent(subId) { java.util.ArrayDeque() }
+                synchronized(history) {
+                    history.addLast(now)
+                    trimServingCellHistory(history, now)
+                }
+            }
+        }
+        servingCellChangeHistory.keys.filterNot(next::containsKey).forEach(servingCellChangeHistory::remove)
+    }
+
+    private fun recentServingCellChanges(subId: Int, now: Long): Int {
+        val history = servingCellChangeHistory[subId] ?: return 0
+        return synchronized(history) {
+            trimServingCellHistory(history, now)
+            history.size
+        }
+    }
+
+    private fun trimServingCellHistory(history: java.util.ArrayDeque<Long>, now: Long) {
+        while (history.isNotEmpty() && now - history.first > SERVING_CELL_HISTORY_MS) history.removeFirst()
     }
 
     private fun requestDataUsageRefresh(lines: List<SimLine>) {
@@ -1570,7 +1662,7 @@ class MonitorService : Service() {
         private const val ALTERNATE_CACHE_MS = 30_000L
         private const val USAGE_CACHE_MS = 15L * 60_000L
         private const val RADIO_REFRESH_INTERVAL_MS = 10_000L
-        private const val DETAILED_RADIO_LOG_INTERVAL_MS = 60_000L
+        private const val SERVING_CELL_HISTORY_MS = 2L * 60_000L
         private const val COMPARISON_TRIAL_COOLDOWN_MS = 5L * 60_000L
         private const val COMPARISON_REASON_QUALITY_RECOVERY = "quality_recovery"
         private const val COMPARISON_REASON_QUOTA_BALANCE = "quota_balance"
