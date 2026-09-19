@@ -5,10 +5,15 @@ Galaxy S26 Ultra（SM-S948Q / One UI 8.5）を最優先の検証端末としつ�
 ## 主な機能
 
 - データ、通話、メッセージの既定SIMを完全に独立して変更
-- 電波強度・実効速度・遅延・疎通・残容量をスコア化してデータSIMを自動切替
+- 電波強度・RSRQ・SINR・実効速度・遅延・疎通・残容量をスコア化してデータSIMを自動切替
+- 無線状態はホームとは別の専用ページで表示し、開いている間は5秒ごとに更新
+- NetMonster CoreでRIL値を検証・統合し、Primary / Secondary / Neighborの全セルをSIM別に保持
+- PLMN、MCC/MNC、国コード、バンド、チャネル、ARFCN、帯域幅、CA、各方式のセル識別子を観測
+- LTEのRSSI/RSRP/RSRQ/SNR/CQI/Timing Advance、NRのSS/CSI RSRP・RSRQ・SINR、旧世代方式のRSCP/EcNo/BER/CDMA・EVDO値など、端末から得られた信号項目を方式別に表示・記録
 - 電波レベル・在圏状態・通信方式・データ接続・通話状態・既定ネットワーク・SIM構成の変化を受けて即時再評価
 - `-114 dBm`以下を既定の弱電波として減点し、品質低下中は3秒間隔で連続判定
 - 一度の小さな疎通成功では悪化履歴を全消去せず、回復に応じて段階的に減衰
+- 2.5秒未満に集中した回線コールバックは同じ不良サンプルとして扱い、Wi-Fi切断直後などの過渡状態による誤切替を抑制
 - 画面復帰時は電波・疎通を先行表示し、通信量集計は別スレッドで更新して初回判定を塞がない
 - 端末のスリープ中は監視・通信測定・自動切替を停止し、画面復帰時に再開
 - 通話・メッセージをデータSIMへ追従させるか個別に設定
@@ -65,7 +70,7 @@ Android 13以降では通知権限を宣言・要求しないため、監視通�
 
 ## 診断ログ
 
-最大約10MB（2MB×現在分＋4世代）のJSON Lines形式で、Direct Boot対応のアプリ専用領域に保存します。電話番号、ICCID、IMSI、IMEIは記録しません。各監視周期には通信経路、SIM名／ID、dBm、品質スコアと内訳、両SIMの比較値、残容量、判定、切替しなかった理由、Shizuku状態を含みます。SIM Pilotが要求した変更は `app/ui_manual`、`app/auto_failover`、`app/comparison_probe`、`app/comparison_revert`、`app/wifi_restore`、それ以外の変更は `external_user_or_system` と記録します。
+最大約10MB（2MB×現在分＋4世代）のJSON Lines形式で、Direct Boot対応のアプリ専用領域に保存します。電話番号、ICCID、IMSI、IMEIは記録しません。各監視周期には通信経路、SIM名／ID、dBm、RSRP/RSRQ/SINR、周波数帯・チャネル・CA、品質スコアと内訳、両SIMの比較値、残容量、判定、切替しなかった理由、Shizuku状態を含みます。全セルの詳細は構成変更時および60秒ごとに記録し、容量を浪費せずハンドオーバーも追跡します。SIM Pilotが要求した変更は `app/ui_manual`、`app/auto_failover`、`app/comparison_probe`、`app/comparison_revert`、`app/wifi_restore`、それ以外の変更は `external_user_or_system` と記録します。
 
 接続中の端末からログと現在のシステム状態をまとめて取得できます。
 
@@ -83,7 +88,7 @@ adb -s 192.168.3.13:5555 exec-out run-as dev.simpilot cat /data/user_de/0/dev.si
 
 ## 判定と通信量
 
-通常は小さな204応答だけを確認し、定期確認・弱電波・遅延悪化時に64KBをダウンロードして実効速度を測ります。電波、遅延、速度を0〜100の悪化スコアへ合算し、既定値では45以上を低品質、20以上を品質低下として扱います。目標速度、弱電波dBm、連続回数、監視間隔、クールダウンは「設定 → 通信品質」で調整できます。
+通常は小さな204応答だけを確認し、定期確認・弱電波・RSRQ/SINR悪化・遅延悪化時に64KBをダウンロードして実効速度を測ります。電波、電波品質、遅延、速度を0〜100の悪化スコアへ合算し、既定値では45以上を低品質、20以上を品質低下として扱います。目標速度、弱電波dBm、連続回数、監視間隔、クールダウンは「設定 → 通信品質」で調整できます。NetMonster情報を取得できない端末やタイミングでは、従来のAndroid公開API値だけで判定を継続します。
 
 「設定 → データプラン」ではSIMごとに次を設定できます。
 
@@ -108,4 +113,8 @@ SIM別実績はShizukuのshell権限からAndroidのネットワーク統計を�
 
 ## プライバシー
 
-電話番号、ICCID、IMEIは取得・保存しません。加入者識別子はSIM別通信量を公開APIへ問い合わせる間だけメモリ上で扱い、保存・表示・ログ出力しません。回線名、SIMスロット、電波レベル、既定SIM ID、品質測定値、通信量集計だけを端末内で扱います。疎通確認先は Android connectivity check、速度測定先は Cloudflare Speed Testです。
+電話番号、ICCID、IMEIは取得・保存しません。加入者識別子はSIM別通信量を公開APIへ問い合わせる間だけメモリ上で扱い、保存・表示・ログ出力しません。診断のため、回線名、SIMスロット、電波値、帯域、PCI、TAC、Cell ID、既定SIM ID、品質測定値、通信量集計を端末内だけで扱います。セル識別情報はおおよその場所を推測できる場合があるため、ログ共有時は取り扱いに注意してください。疎通確認先は Android connectivity check、速度測定先は Cloudflare Speed Testです。
+
+## サードパーティ
+
+- [NetMonster Core](https://github.com/mroczis/netmonster-core) 1.3.0 — Apache License 2.0。Android Telephony/RIL情報の検証・統合とLTE/NR無線パラメータ取得に使用します。

@@ -8,6 +8,8 @@ data class QualitySample(
     val validated: Boolean,
     val latencyMs: Long?,
     val speedKbps: Long?,
+    val rsrqDb: Double? = null,
+    val sinrDb: Double? = null,
 )
 
 enum class QualityVerdict { GOOD, DEGRADED, BAD, INCONCLUSIVE }
@@ -35,6 +37,15 @@ object AutoSwitchDecider {
         val reasons = mutableListOf<String>()
         var score = signalPenalty(sample, config).also { penalty ->
             if (penalty > 0) reasons += "電波 ${sample.dbm?.let { "$it dBm" } ?: "${sample.signalLevel}/4"}"
+        }
+
+        val radioQualityPenalty = radioQualityPenalty(sample.rsrqDb, sample.sinrDb)
+        score += radioQualityPenalty
+        if (sample.rsrqDb != null && rsrqPenalty(sample.rsrqDb) > 0) {
+            reasons += "電波品質 RSRQ ${"%.1f".format(sample.rsrqDb)}dB"
+        }
+        if (sample.sinrDb != null && sinrPenalty(sample.sinrDb) > 0) {
+            reasons += "雑音比 SINR ${"%.1f".format(sample.sinrDb)}dB"
         }
 
         sample.latencyMs?.let { latency ->
@@ -113,6 +124,7 @@ object AutoSwitchDecider {
     ): Boolean {
         if (!quotaAdvantage || current.verdict != QualityVerdict.GOOD) return false
         if (millisSinceSwitch < QUOTA_BALANCE_STABILITY_MS) return false
+        candidate.radio?.let { if (radioQualityPenalty(it.rsrqDb, it.sinrDb) >= 20) return false }
         return candidate.dbm?.let { it > config.weakSignalDbm + 6 }
             ?: (candidate.signalLevel >= 3)
     }
@@ -128,13 +140,36 @@ object AutoSwitchDecider {
         if (current.connectivityFailure) return canUseAlternate(candidate)
         val candidateDbm = candidate.dbm
         val currentDbm = currentLine.dbm
+        val currentRadioPenalty = currentLine.radio?.let { radioQualityPenalty(it.rsrqDb, it.sinrDb) }
+        val candidateRadioPenalty = candidate.radio?.let { radioQualityPenalty(it.rsrqDb, it.sinrDb) }
+        val qualityClearlyBetter = currentRadioPenalty != null && candidateRadioPenalty != null &&
+            candidateRadioPenalty + 10 <= currentRadioPenalty
         if (candidateDbm != null) {
             if (candidateDbm <= config.weakSignalDbm) return false
-            return currentDbm == null || candidateDbm >= currentDbm - 6
+            return currentDbm == null || candidateDbm >= currentDbm - 6 || qualityClearlyBetter
         }
         return candidate.signalLevel >= 2 &&
-            (currentLine.signalLevel < 0 || candidate.signalLevel >= currentLine.signalLevel - 1)
+            (currentLine.signalLevel < 0 || candidate.signalLevel >= currentLine.signalLevel - 1 || qualityClearlyBetter)
     }
+
+    fun radioQualityPenalty(rsrqDb: Double?, sinrDb: Double?): Int =
+        (rsrqDb?.let(::rsrqPenalty).orZero() + sinrDb?.let(::sinrPenalty).orZero()).coerceAtMost(24)
+
+    private fun rsrqPenalty(rsrqDb: Double): Int = when {
+        rsrqDb <= -18.0 -> 16
+        rsrqDb <= -15.0 -> 10
+        rsrqDb <= -12.0 -> 5
+        else -> 0
+    }
+
+    private fun sinrPenalty(sinrDb: Double): Int = when {
+        sinrDb <= 0.0 -> 18
+        sinrDb <= 5.0 -> 12
+        sinrDb <= 10.0 -> 6
+        else -> 0
+    }
+
+    private fun Int?.orZero(): Int = this ?: 0
 
     private fun signalPenalty(sample: QualitySample, config: MonitorConfig): Int {
         sample.dbm?.let { dbm ->

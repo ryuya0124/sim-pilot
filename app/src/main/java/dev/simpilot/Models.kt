@@ -25,10 +25,79 @@ data class SimLine(
     val inService: Boolean = false,
     val serviceStateKnown: Boolean = false,
     val networkType: String = "—",
+    val radio: RadioMetrics? = null,
 ) {
     val title: String get() = displayName.ifBlank { carrierName.ifBlank { "SIM ${slotIndex + 1}" } }
     val subtitle: String get() = "SIM ${slotIndex + 1} · ${carrierName.ifBlank { "回線" }}"
 }
+
+data class RadioMetrics(
+    val technology: String,
+    val primaryConnected: Boolean,
+    val servingCellCount: Int,
+    val neighboringCellCount: Int,
+    val secondaryCellCount: Int,
+    val bandNumber: Int? = null,
+    val bandName: String? = null,
+    val channelNumber: Int? = null,
+    val aggregatedBands: List<String> = emptyList(),
+    val bandwidthKhz: Int? = null,
+    val referenceDbm: Int? = null,
+    val rssiDbm: Int? = null,
+    val rsrpDbm: Double? = null,
+    val rsrqDb: Double? = null,
+    val sinrDb: Double? = null,
+    val cqi: Int? = null,
+    val timingAdvance: Int? = null,
+    val pci: Int? = null,
+    val areaCode: Long? = null,
+    val cellId: Long? = null,
+    val cells: List<RadioCellObservation> = emptyList(),
+    val observedAtElapsed: Long,
+) {
+    val carrierAggregation: Boolean
+        get() = secondaryCellCount > 0 || aggregatedBands.isNotEmpty()
+
+    val bandLabel: String?
+        get() = bandNumber?.let { number ->
+            val prefix = if (technology.startsWith("5G")) "n" else "B"
+            "$prefix$number"
+        } ?: bandName
+}
+
+data class RadioCellObservation(
+    val technology: String,
+    val connection: String,
+    val connectionInferred: Boolean = false,
+    val network: List<RadioField> = emptyList(),
+    val band: List<RadioField> = emptyList(),
+    val identity: List<RadioField> = emptyList(),
+    val signal: List<RadioField> = emptyList(),
+    val sourceTimestamp: Long? = null,
+) {
+    val title: String
+        get() = buildString {
+            append(technology)
+            band.firstOrNull { it.key == "band" }?.value?.let { append(" · ").append(it) }
+        }
+
+    fun logValue(): Map<String, Any?> = mapOf(
+        "technology" to technology,
+        "connection" to connection,
+        "connectionInferred" to connectionInferred,
+        "network" to network.associate { it.key to it.value },
+        "band" to band.associate { it.key to it.value },
+        "identity" to identity.associate { it.key to it.value },
+        "signal" to signal.associate { it.key to it.value },
+        "sourceTimestamp" to sourceTimestamp,
+    )
+}
+
+data class RadioField(
+    val key: String,
+    val label: String,
+    val value: String,
+)
 
 data class MonitorConfig(
     val enabled: Boolean = false,

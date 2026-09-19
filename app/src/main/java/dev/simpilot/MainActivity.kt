@@ -10,6 +10,7 @@ import android.os.SystemClock
 import android.os.UserManager
 import android.provider.Settings
 import androidx.activity.ComponentActivity
+import androidx.activity.compose.BackHandler
 import androidx.activity.compose.setContent
 import androidx.activity.compose.rememberLauncherForActivityResult
 import androidx.activity.enableEdgeToEdge
@@ -194,6 +195,9 @@ private fun SimPilotApp(repository: SimRepository) {
     var config by remember { mutableStateOf(AppPreferences(context).load()) }
     var plans by remember { mutableStateOf(AppPreferences(context).loadPlans()) }
     var showSettings by remember { mutableStateOf(false) }
+    var appPage by remember { mutableStateOf(AppPage.HOME) }
+    var radioRefreshing by remember { mutableStateOf(false) }
+    var radioRefreshToken by remember { mutableStateOf(0) }
     var busyRole by remember { mutableStateOf<SimRole?>(null) }
     val switchAudit = remember { SwitchAudit(context) }
     val scope = rememberCoroutineScope()
@@ -246,6 +250,20 @@ private fun SimPilotApp(repository: SimRepository) {
                 it.copy(switchBackend = "切替方式を確認できません", backendChecked = true, supportedRoles = emptySet())
             }
             DiagnosticLog.warn(context, "switch_backend_failed", "アプリ画面で切替方式を確認できませんでした", error = it)
+        }
+    }
+
+    LaunchedEffect(appPage, radioRefreshToken, snapshot.lines.map { it.subId }) {
+        if (appPage != AppPage.RADIO) return@LaunchedEffect
+        while (true) {
+            val activeSubIds = AppState.current().lines.mapTo(linkedSetOf()) { it.subId }
+            if (activeSubIds.isNotEmpty()) {
+                radioRefreshing = true
+                withContext(Dispatchers.IO) { repository.refreshRadioDetails(activeSubIds) }
+                repository.refresh()
+                radioRefreshing = false
+            }
+            delay(5_000)
         }
     }
 
@@ -319,6 +337,17 @@ private fun SimPilotApp(repository: SimRepository) {
             }
             busyRole = null
         }
+    }
+
+    if (appPage == AppPage.RADIO) {
+        BackHandler { appPage = AppPage.HOME }
+        RadioDetailsPage(
+            lines = snapshot.lines,
+            refreshing = radioRefreshing,
+            onBack = { appPage = AppPage.HOME },
+            onRefresh = { radioRefreshToken++ },
+        )
+        return
     }
 
     Box(
@@ -399,6 +428,16 @@ private fun SimPilotApp(repository: SimRepository) {
                 item { SimDetails(snapshot.lines, snapshot.dataSubId, snapshot.dataUsage) }
                 item {
                     FilledTonalButton(
+                        onClick = { appPage = AppPage.RADIO },
+                        modifier = Modifier.fillMaxWidth(),
+                    ) {
+                        Icon(Icons.Rounded.CellTower, null)
+                        Spacer(Modifier.width(8.dp))
+                        Text("無線詳細を表示")
+                    }
+                }
+                item {
+                    FilledTonalButton(
                         onClick = {
                             context.startActivity(Intent(Settings.ACTION_IGNORE_BATTERY_OPTIMIZATION_SETTINGS))
                         },
@@ -426,6 +465,8 @@ private fun SimPilotApp(repository: SimRepository) {
         )
     }
 }
+
+private enum class AppPage { HOME, RADIO }
 
 @Composable
 private fun Hero(snapshot: AppSnapshot, config: MonitorConfig, onSettings: () -> Unit) {
@@ -666,6 +707,167 @@ private fun SimDetails(lines: List<SimLine>, dataSubId: Int, dataUsage: Map<Int,
 }
 
 private fun signalText(level: Int) = if (level < 0) "取得中" else "電波 $level/4"
+
+@Composable
+private fun RadioDetailsPage(
+    lines: List<SimLine>,
+    refreshing: Boolean,
+    onBack: () -> Unit,
+    onRefresh: () -> Unit,
+) {
+    var selectedSubId by remember { mutableStateOf(lines.firstOrNull()?.subId ?: -1) }
+    LaunchedEffect(lines.map { it.subId }) {
+        if (selectedSubId !in lines.map { it.subId }) selectedSubId = lines.firstOrNull()?.subId ?: -1
+    }
+    val selectedLine = lines.firstOrNull { it.subId == selectedSubId } ?: lines.firstOrNull()
+    Surface(Modifier.fillMaxSize(), color = MaterialTheme.colorScheme.surface) {
+        LazyColumn(
+            contentPadding = PaddingValues(
+                start = 18.dp,
+                end = 18.dp,
+                top = WindowInsets.safeDrawing.asPaddingValues().calculateTopPadding() + 8.dp,
+                bottom = WindowInsets.safeDrawing.asPaddingValues().calculateBottomPadding() + 28.dp,
+            ),
+            verticalArrangement = Arrangement.spacedBy(14.dp),
+        ) {
+            item {
+                Row(verticalAlignment = Alignment.CenterVertically) {
+                    IconButton(onClick = onBack) {
+                        Icon(Icons.AutoMirrored.Rounded.ArrowBack, "ホームへ戻る")
+                    }
+                    Spacer(Modifier.width(4.dp))
+                    Column(Modifier.weight(1f)) {
+                        Text("無線状態", style = MaterialTheme.typography.headlineMedium, fontWeight = FontWeight.Bold)
+                        Text(
+                            "接続セル・副セル・近隣セルを5秒ごとに観測",
+                            style = MaterialTheme.typography.bodySmall,
+                            color = MaterialTheme.colorScheme.onSurfaceVariant,
+                        )
+                    }
+                    IconButton(onClick = onRefresh, enabled = !refreshing) {
+                        Icon(Icons.Rounded.Refresh, if (refreshing) "更新中" else "今すぐ更新")
+                    }
+                }
+            }
+            item {
+                Surface(shape = RoundedCornerShape(18.dp), color = MaterialTheme.colorScheme.secondaryContainer) {
+                    Text(
+                        "NetMonster Coreが端末から返された値を検証・統合して表示します。端末や基地局が公開しない項目は表示されません。セル識別子や基地局座標は位置を推測できる情報です。",
+                        Modifier.padding(15.dp),
+                        style = MaterialTheme.typography.bodySmall,
+                        color = MaterialTheme.colorScheme.onSecondaryContainer,
+                    )
+                }
+            }
+            if (lines.isEmpty()) {
+                item { Text("有効なSIMがありません", color = MaterialTheme.colorScheme.onSurfaceVariant) }
+            }
+            if (lines.isNotEmpty()) {
+                item {
+                    FlowRow(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                        lines.forEach { line ->
+                            FilterChip(
+                                selected = line.subId == selectedSubId,
+                                onClick = { selectedSubId = line.subId },
+                                label = { Text("SIM ${line.slotIndex + 1} · ${line.title}") },
+                            )
+                        }
+                    }
+                }
+            }
+            selectedLine?.let { line ->
+                item(key = line.subId) { RadioLineDetails(line) }
+            }
+        }
+    }
+}
+
+@Composable
+private fun RadioLineDetails(line: SimLine) {
+    val radio = line.radio
+    Card(
+        shape = RoundedCornerShape(24.dp),
+        colors = CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.surfaceContainer),
+    ) {
+        Column(Modifier.padding(18.dp), verticalArrangement = Arrangement.spacedBy(12.dp)) {
+            Row(verticalAlignment = Alignment.CenterVertically) {
+                Surface(shape = CircleShape, color = MaterialTheme.colorScheme.primaryContainer) {
+                    Text("${line.slotIndex + 1}", Modifier.padding(horizontal = 12.dp, vertical = 8.dp), fontWeight = FontWeight.Bold)
+                }
+                Spacer(Modifier.width(10.dp))
+                Column(Modifier.weight(1f)) {
+                    Text(line.title, fontWeight = FontWeight.Bold, style = MaterialTheme.typography.titleLarge)
+                    Text("subId ${line.subId} · ${radio?.technology ?: line.networkType}", style = MaterialTheme.typography.bodySmall)
+                }
+                Text(radio?.referenceDbm?.let { "$it dBm" } ?: "取得待ち", style = MaterialTheme.typography.labelMedium)
+            }
+            if (radio == null) {
+                Text(
+                    "取得中です。電話と位置情報の権限を確認してください。",
+                    style = MaterialTheme.typography.bodySmall,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant,
+                )
+                return@Column
+            }
+            HorizontalDivider(color = MaterialTheme.colorScheme.onSurface.copy(alpha = .10f))
+            RadioDetailRow("セル構成", "Primary ${if (radio.primaryConnected) 1 else 0} · Secondary ${radio.secondaryCellCount} · Neighbor ${radio.neighboringCellCount}")
+            RadioDetailRow("代表バンド", listOfNotNull(radio.bandLabel, radio.channelNumber?.let { "CH $it" }).joinToString(" · ").ifBlank { "—" })
+            RadioDetailRow("品質", "RSRP ${radio.rsrpDbm?.let { "%.1f".format(it) } ?: "—"} · RSRQ ${radio.rsrqDb?.let { "%.1f".format(it) } ?: "—"} · SINR ${radio.sinrDb?.let { "%.1f".format(it) } ?: "—"}")
+            if (radio.aggregatedBands.isNotEmpty()) {
+                RadioDetailRow("CA", radio.aggregatedBands.joinToString(" + "))
+            }
+            Text("観測セル ${radio.cells.size}件", fontWeight = FontWeight.Bold, style = MaterialTheme.typography.titleMedium)
+            radio.cells.forEachIndexed { index, cell ->
+                RadioCellCard(index + 1, cell)
+            }
+        }
+    }
+}
+
+@Composable
+private fun RadioCellCard(index: Int, cell: RadioCellObservation) {
+    Surface(shape = RoundedCornerShape(18.dp), color = MaterialTheme.colorScheme.surfaceContainerLowest) {
+        Column(Modifier.padding(14.dp), verticalArrangement = Arrangement.spacedBy(9.dp)) {
+            Row(verticalAlignment = Alignment.CenterVertically) {
+                Column(Modifier.weight(1f)) {
+                    Text("#$index  ${cell.title}", fontWeight = FontWeight.Bold)
+                    Text(
+                        cell.connection + if (cell.connectionInferred) "（推定）" else "",
+                        style = MaterialTheme.typography.labelMedium,
+                        color = when (cell.connection) {
+                            "Primary" -> MaterialTheme.colorScheme.primary
+                            "Secondary" -> MaterialTheme.colorScheme.tertiary
+                            else -> MaterialTheme.colorScheme.onSurfaceVariant
+                        },
+                    )
+                }
+                cell.sourceTimestamp?.let {
+                    Text("TS $it", style = MaterialTheme.typography.labelSmall, color = MaterialTheme.colorScheme.onSurfaceVariant)
+                }
+            }
+            RadioFieldGroup("ネットワーク", cell.network)
+            RadioFieldGroup("周波数", cell.band)
+            RadioFieldGroup("セル識別", cell.identity)
+            RadioFieldGroup("信号", cell.signal)
+        }
+    }
+}
+
+@Composable
+private fun RadioFieldGroup(title: String, fields: List<RadioField>) {
+    if (fields.isEmpty()) return
+    HorizontalDivider(color = MaterialTheme.colorScheme.onSurface.copy(alpha = .08f))
+    Text(title, style = MaterialTheme.typography.labelLarge, color = MaterialTheme.colorScheme.primary)
+    fields.forEach { field -> RadioDetailRow(field.label, field.value) }
+}
+
+@Composable
+private fun RadioDetailRow(label: String, value: String) {
+    Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.spacedBy(12.dp)) {
+        Text(label, Modifier.weight(.42f), style = MaterialTheme.typography.labelMedium, color = MaterialTheme.colorScheme.onSurfaceVariant)
+        Text(value, Modifier.weight(.58f), style = MaterialTheme.typography.bodyMedium, fontWeight = FontWeight.SemiBold)
+    }
+}
 
 @OptIn(ExperimentalMaterial3Api::class)
 @Composable

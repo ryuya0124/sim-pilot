@@ -18,7 +18,7 @@ class AutoSwitchDeciderTest {
         speed: Long? = 5_000,
     ) = QualitySample(inService, known, level, dbm, validated, latency, speed)
 
-    private fun line(dbm: Int? = -100, level: Int = 3) = SimLine(
+    private fun line(dbm: Int? = -100, level: Int = 3, radio: RadioMetrics? = null) = SimLine(
         subId = 5,
         slotIndex = 0,
         displayName = "candidate",
@@ -27,6 +27,20 @@ class AutoSwitchDeciderTest {
         dbm = dbm,
         inService = true,
         serviceStateKnown = true,
+        radio = radio,
+    )
+
+    private fun radio(rsrq: Double, sinr: Double) = RadioMetrics(
+        technology = "4G",
+        primaryConnected = true,
+        servingCellCount = 1,
+        neighboringCellCount = 0,
+        secondaryCellCount = 0,
+        referenceDbm = -100,
+        rsrpDbm = -100.0,
+        rsrqDb = rsrq,
+        sinrDb = sinr,
+        observedAtElapsed = 1,
     )
 
     @Test fun healthySampleStays() {
@@ -88,6 +102,40 @@ class AutoSwitchDeciderTest {
 
     @Test fun weakAndSlowBecomesBad() {
         assertEquals(QualityVerdict.BAD, AutoSwitchDecider.evaluate(sample(dbm = -116, speed = 1_000), config))
+    }
+
+    @Test fun poorRsrqAndSinrDegradeAnOtherwiseFastConnection() {
+        val result = AutoSwitchDecider.assess(sample().copy(rsrqDb = -19.0, sinrDb = 0.0), config)
+        assertEquals(QualityVerdict.DEGRADED, result.verdict)
+        assertEquals(24, result.score)
+        assertTrue(result.reasons.any { it.contains("RSRQ") })
+        assertTrue(result.reasons.any { it.contains("SINR") })
+    }
+
+    @Test fun quotaDoesNotProbeCandidateWithBadRadioQuality() {
+        val current = AutoSwitchDecider.assess(sample(), config)
+        assertFalse(
+            AutoSwitchDecider.shouldTryQuotaBalance(
+                current,
+                line(dbm = -100, radio = radio(rsrq = -19.0, sinr = 0.0)),
+                config,
+                quotaAdvantage = true,
+                millisSinceSwitch = 30L * 60_000L,
+            )
+        )
+    }
+
+    @Test fun clearlyBetterRsrqAndSinrCanJustifyRecoveryProbe() {
+        val currentSample = sample(dbm = -100, speed = 2_000).copy(rsrqDb = -19.0, sinrDb = 0.0)
+        assertTrue(
+            AutoSwitchDecider.shouldTryQualityRecovery(
+                current = AutoSwitchDecider.assess(currentSample, config),
+                currentLine = line(dbm = -100, radio = radio(rsrq = -19.0, sinr = 0.0)),
+                candidate = line(dbm = -107, radio = radio(rsrq = -10.0, sinr = 18.0)),
+                config = config,
+                consecutiveThresholdReached = true,
+            )
+        )
     }
 
     @Test fun clearlyFasterAndStrongerCandidateWins() {

@@ -11,8 +11,8 @@ android {
         applicationId = "dev.simpilot"
         minSdk = 31
         targetSdk = 37
-        versionCode = 13
-        versionName = "1.6.1"
+        versionCode = 14
+        versionName = "1.7.0"
 
         testInstrumentationRunner = "androidx.test.runner.AndroidJUnitRunner"
     }
@@ -44,6 +44,7 @@ dependencies {
     implementation("androidx.core:core-splashscreen:1.2.0")
     implementation("dev.rikka.shizuku:api:13.1.5")
     implementation("dev.rikka.shizuku:provider:13.1.5")
+    implementation("app.netmonster:core:1.3.0")
 
     debugImplementation("androidx.compose.ui:ui-tooling:1.10.5")
     testImplementation("junit:junit:4.13.2")

@@ -47,6 +47,7 @@ import rikka.shizuku.Shizuku
 class MonitorService : Service() {
     private val worker = Executors.newSingleThreadExecutor()
     private val usageWorker = Executors.newSingleThreadExecutor()
+    private val radioWorker = Executors.newSingleThreadExecutor()
     private val mainHandler = Handler(Looper.getMainLooper())
     private lateinit var prefs: AppPreferences
     private lateinit var switchAudit: SwitchAudit
@@ -55,9 +56,13 @@ class MonitorService : Service() {
     private lateinit var powerManager: PowerManager
     private lateinit var subscriptionManager: SubscriptionManager
     private var badSamples = 0
+    private var lastAcceptedBadSampleAtElapsed = 0L
     private var latencyEndpointIndex = 0
     private var lastSpeedProbeAtElapsed = 0L
     private var lastPeriodicAlternateProbeAtElapsed = 0L
+    private var lastRadioRefreshAtElapsed = 0L
+    private var lastDetailedRadioLogAtElapsed = 0L
+    private var lastRadioTopology: Map<Int, String> = emptyMap()
     private val alternateProbeCache = mutableMapOf<Int, TimedQualitySample>()
     private val usageCache = ConcurrentHashMap<Int, TimedUsage>()
     private val lastComparisonTrialAt = mutableMapOf<Int, Long>()
@@ -78,6 +83,7 @@ class MonitorService : Service() {
     private val rerunRequested = AtomicBoolean(false)
     private val forceDeepProbeRequested = AtomicBoolean(false)
     private val usageRefreshInFlight = AtomicBoolean(false)
+    private val radioRefreshInFlight = AtomicBoolean(false)
     private val activeProbeConnection = AtomicReference<HttpURLConnection?>(null)
     @Volatile private var lastWakeAtElapsed: Long? = null
     private val scheduledCycle = Runnable {
@@ -319,6 +325,7 @@ class MonitorService : Service() {
         sims.unregister()
         worker.shutdownNow()
         usageWorker.shutdownNow()
+        radioWorker.shutdownNow()
         DiagnosticLog.info(this, "service_destroyed", "監視サービスを終了")
         AppState.update { it.copy(monitorRunning = false, status = "停止中") }
         super.onDestroy()
@@ -503,6 +510,7 @@ class MonitorService : Service() {
             finishCycle("有効なSIMは${lines.size}回線 · 自動切替を待機", config)
             return
         }
+        requestRadioRefresh(lines, force = forceDeepProbe || wakeStartedAtElapsed != null)
 
         val dataSubId = SubscriptionManager.getDefaultDataSubscriptionId()
         val current = lines.firstOrNull { it.subId == dataSubId }
@@ -556,10 +564,13 @@ class MonitorService : Service() {
             ?: (current.signalLevel in 0..1)
         val nowElapsed = SystemClock.elapsedRealtime()
         val rapidSpeedDue = nowElapsed - lastSpeedProbeAtElapsed >= RAPID_SPEED_MIN_GAP_MS
+        val radioQualityPoor = current.radio?.let {
+            AutoSwitchDecider.radioQualityPenalty(it.rsrqDb, it.sinrDb) >= 12
+        } == true
         val periodicSpeedDue = nowElapsed - lastSpeedProbeAtElapsed >=
             maxOf(config.intervalSeconds * 10_000L, MIN_PERIODIC_SPEED_INTERVAL_MS)
         val shouldMeasureSpeed = forceDeepProbe ||
-            (rapidSpeedDue && (weakSignal || latency == null || latency > config.latencyThresholdMs * 2L / 3L)) ||
+            (rapidSpeedDue && (weakSignal || radioQualityPoor || latency == null || latency > config.latencyThresholdMs * 2L / 3L)) ||
             periodicSpeedDue
         val speedProbeStarted = SystemClock.elapsedRealtime()
         val speed = if (shouldMeasureSpeed) {
@@ -580,13 +591,26 @@ class MonitorService : Service() {
             validated = validated,
             latencyMs = latency,
             speedKbps = speed,
+            rsrqDb = current.radio?.rsrqDb,
+            sinrDb = current.radio?.sinrDb,
         )
         val assessment = AutoSwitchDecider.assess(sample, config)
         val verdict = assessment.verdict
         val bad = verdict == QualityVerdict.BAD
+        val historyNow = SystemClock.elapsedRealtime()
+        val acceptBadSample = MonitorTiming.shouldAcceptBadSample(
+            currentCount = badSamples,
+            lastAcceptedAt = lastAcceptedBadSampleAtElapsed,
+            now = historyNow,
+        )
         badSamples = when (verdict) {
-            QualityVerdict.BAD -> badSamples + 1
-            QualityVerdict.DEGRADED -> badSamples + 1
+            QualityVerdict.BAD,
+            QualityVerdict.DEGRADED -> if (acceptBadSample) {
+                lastAcceptedBadSampleAtElapsed = historyNow
+                badSamples + 1
+            } else {
+                badSamples
+            }
             QualityVerdict.GOOD -> (badSamples - 1).coerceAtLeast(0)
             QualityVerdict.INCONCLUSIVE -> badSamples
         }
@@ -621,6 +645,7 @@ class MonitorService : Service() {
                 "qualityScore" to assessment.score,
                 "verdict" to verdict.name.lowercase(),
                 "badSamples" to badSamples,
+                "badSampleAccepted" to (assessment.needsRapidRecheck && acceptBadSample),
                 "wakeToCycleStartMs" to wakeToCycleStartMs,
                 "latencyProbeElapsedMs" to latencyProbeElapsedMs,
                 "speedProbeElapsedMs" to speedProbeElapsedMs,
@@ -628,7 +653,7 @@ class MonitorService : Service() {
                 "wakeToPrimaryResultMs" to wakeStartedAtElapsed?.let {
                     (SystemClock.elapsedRealtime() - it).coerceAtLeast(0L)
                 },
-            ),
+            ) + radioLogFields("radio", current.radio),
         )
         if (wakeStartedAtElapsed != null && lastWakeAtElapsed == wakeStartedAtElapsed) {
             lastWakeAtElapsed = null
@@ -689,6 +714,7 @@ class MonitorService : Service() {
                 "qualityScore" to assessment.score,
                 "qualityReasons" to assessment.reasons.joinToString(", "),
                 "badSamples" to badSamples,
+                "badSampleAccepted" to (assessment.needsRapidRecheck && acceptBadSample),
                 "requiredBadSamples" to config.consecutiveFailures,
                 "alternateSubId" to alternate?.subId,
                 "alternateName" to alternate?.title,
@@ -708,7 +734,7 @@ class MonitorService : Service() {
                 "speedProbeElapsedMs" to speedProbeElapsedMs,
                 "alternateProbeElapsedMs" to alternateProbeElapsedMs,
                 "cycleElapsedMs" to (SystemClock.elapsedRealtime() - cycleStartedAtElapsed),
-            ),
+            ) + radioLogFields("radio", current.radio) + radioLogFields("alternateRadio", alternate?.radio),
         )
 
         val cooldownMs = config.cooldownMinutes * 60_000L
@@ -751,6 +777,7 @@ class MonitorService : Service() {
                 }
                 ComparisonResult.REVERTED -> {
                     badSamples = (config.consecutiveFailures - 1).coerceAtLeast(0)
+                    lastAcceptedBadSampleAtElapsed = SystemClock.elapsedRealtime()
                     finishCycle("${current.title}を維持 · ${alternate.title}の比較結果が優位ではありません", config)
                     return
                 }
@@ -1069,6 +1096,8 @@ class MonitorService : Service() {
             validated = validated,
             latencyMs = latency,
             speedKbps = speed,
+            rsrqDb = line.radio?.rsrqDb,
+            sinrDb = line.radio?.sinrDb,
         )
         alternateProbeCache[line.subId] = TimedQualitySample(sample, System.currentTimeMillis())
         DiagnosticLog.info(
@@ -1085,7 +1114,7 @@ class MonitorService : Service() {
                 "latencyMs" to latency,
                 "speedKbps" to speed,
                 "score" to AutoSwitchDecider.assess(sample, config).score,
-            ),
+            ) + radioLogFields("radio", line.radio),
         )
         return sample
     }
@@ -1232,6 +1261,8 @@ class MonitorService : Service() {
             validated = true,
             latencyMs = latency,
             speedKbps = speed,
+            rsrqDb = refreshedCandidate.radio?.rsrqDb,
+            sinrDb = refreshedCandidate.radio?.sinrDb,
         )
         val candidateAssessment = AutoSwitchDecider.assess(candidateSample, config)
         alternateProbeCache[candidate.subId] = TimedQualitySample(candidateSample, System.currentTimeMillis())
@@ -1261,7 +1292,8 @@ class MonitorService : Service() {
                 "keepCandidate" to keep,
                 "reason" to reason,
                 "durationMs" to (SystemClock.elapsedRealtime() - comparisonStartedAt),
-            ),
+            ) + radioLogFields("currentRadio", current.radio) +
+                radioLogFields("candidateRadio", refreshedCandidate.radio),
         )
         return if (keep) {
             switchFollowersAndRecord(candidate.subId, config, sims.refresh(), "comparison_keep_follower")
@@ -1299,6 +1331,100 @@ class MonitorService : Service() {
                 DataPlanPolicy.state(plan, measured)?.let { put(line.subId, it) }
             }
         }
+    }
+
+    private fun requestRadioRefresh(lines: List<SimLine>, force: Boolean) {
+        val now = SystemClock.elapsedRealtime()
+        if (!force && now - lastRadioRefreshAtElapsed < RADIO_REFRESH_INTERVAL_MS) return
+        if (!radioRefreshInFlight.compareAndSet(false, true)) return
+        lastRadioRefreshAtElapsed = now
+        val activeSubIds = lines.mapTo(linkedSetOf()) { it.subId }
+        radioWorker.execute {
+            val started = SystemClock.elapsedRealtime()
+            try {
+                if (stopped.get() || !powerManager.isInteractive) return@execute
+                sims.refreshRadioDetails(activeSubIds)
+                    .onSuccess { result ->
+                        if (!powerManager.isInteractive || stopped.get()) {
+                            sims.clearRadioDetails()
+                            return@onSuccess
+                        }
+                        val refreshedLines = sims.refresh()
+                        val topology = result.metrics.mapValues { (_, radio) -> radio.topologyKey() }
+                        val topologyChanged = topology != lastRadioTopology
+                        lastRadioTopology = topology
+                        val logNow = SystemClock.elapsedRealtime()
+                        if (topologyChanged || logNow - lastDetailedRadioLogAtElapsed >= DETAILED_RADIO_LOG_INTERVAL_MS) {
+                            lastDetailedRadioLogAtElapsed = logNow
+                            result.metrics.forEach { (subId, radio) ->
+                                val line = refreshedLines.firstOrNull { it.subId == subId }
+                                DiagnosticLog.info(
+                                    this@MonitorService,
+                                    "radio_snapshot",
+                                    "NetMonster Coreで無線状態を観測",
+                                    mapOf(
+                                        "subId" to subId,
+                                        "name" to line?.title,
+                                        "durationMs" to (SystemClock.elapsedRealtime() - started),
+                                        "topologyChanged" to topologyChanged,
+                                        "radioCells" to radio.cells.map(RadioCellObservation::logValue),
+                                    ) + radioLogFields("radio", radio),
+                                )
+                            }
+                        }
+                        if (result.materiallyChanged) scheduleNext(250)
+                    }
+                    .onFailure { error ->
+                        DiagnosticLog.warn(
+                            this@MonitorService,
+                            "radio_snapshot_unavailable",
+                            "NetMonster Coreの無線情報を取得できません",
+                            mapOf("subIds" to activeSubIds.joinToString(",")),
+                            error,
+                        )
+                    }
+            } finally {
+                radioRefreshInFlight.set(false)
+            }
+        }
+    }
+
+    private fun radioLogFields(prefix: String, radio: RadioMetrics?): Map<String, Any?> {
+        if (radio == null) return mapOf("${prefix}Available" to false)
+        return mapOf(
+            "${prefix}Available" to true,
+            "${prefix}Technology" to radio.technology,
+            "${prefix}PrimaryConnected" to radio.primaryConnected,
+            "${prefix}ServingCells" to radio.servingCellCount,
+            "${prefix}NeighboringCells" to radio.neighboringCellCount,
+            "${prefix}SecondaryCells" to radio.secondaryCellCount,
+            "${prefix}Band" to radio.bandLabel,
+            "${prefix}BandName" to radio.bandName,
+            "${prefix}Channel" to radio.channelNumber,
+            "${prefix}AggregatedBands" to radio.aggregatedBands.joinToString(","),
+            "${prefix}BandwidthKhz" to radio.bandwidthKhz,
+            "${prefix}ReferenceDbm" to radio.referenceDbm,
+            "${prefix}RssiDbm" to radio.rssiDbm,
+            "${prefix}RsrpDbm" to radio.rsrpDbm,
+            "${prefix}RsrqDb" to radio.rsrqDb,
+            "${prefix}SinrDb" to radio.sinrDb,
+            "${prefix}Cqi" to radio.cqi,
+            "${prefix}TimingAdvance" to radio.timingAdvance,
+            "${prefix}Pci" to radio.pci,
+            "${prefix}AreaCode" to radio.areaCode,
+            "${prefix}CellId" to radio.cellId,
+            "${prefix}ObservedAtElapsed" to radio.observedAtElapsed,
+        )
+    }
+
+    private fun RadioMetrics.topologyKey(): String = cells.joinToString("|") { cell ->
+        listOf(
+            cell.technology,
+            cell.connection,
+            cell.connectionInferred,
+            cell.band.joinToString(",") { "${it.key}=${it.value}" },
+            cell.identity.joinToString(",") { "${it.key}=${it.value}" },
+        ).joinToString(";")
     }
 
     private fun requestDataUsageRefresh(lines: List<SimLine>) {
@@ -1443,6 +1569,8 @@ class MonitorService : Service() {
         private const val ALTERNATE_REQUEST_TIMEOUT_MS = 2_500L
         private const val ALTERNATE_CACHE_MS = 30_000L
         private const val USAGE_CACHE_MS = 15L * 60_000L
+        private const val RADIO_REFRESH_INTERVAL_MS = 10_000L
+        private const val DETAILED_RADIO_LOG_INTERVAL_MS = 60_000L
         private const val COMPARISON_TRIAL_COOLDOWN_MS = 5L * 60_000L
         private const val COMPARISON_REASON_QUALITY_RECOVERY = "quality_recovery"
         private const val COMPARISON_REASON_QUOTA_BALANCE = "quota_balance"

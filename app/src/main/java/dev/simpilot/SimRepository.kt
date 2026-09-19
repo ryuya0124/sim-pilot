@@ -5,6 +5,7 @@ import android.annotation.SuppressLint
 import android.content.Context
 import android.content.pm.PackageManager
 import android.os.Build
+import android.os.SystemClock
 import android.telephony.ServiceState
 import android.telephony.SignalStrength
 import android.telephony.SubscriptionManager
@@ -23,6 +24,7 @@ class SimRepository(
 ) {
     private val subscriptionManager = context.getSystemService(SubscriptionManager::class.java)
     private val telephonyManager = context.getSystemService(TelephonyManager::class.java)
+    private val radioSource = NetMonsterRadioSource(context)
     private val callbacks = ConcurrentHashMap<Int, LineCallback>()
     private val observations = ConcurrentHashMap<Int, Observation>()
     private val paused = AtomicBoolean(false)
@@ -133,16 +135,20 @@ class SimRepository(
         }
         val lines = infos.map { info ->
             val o = observations[info.subscriptionId] ?: Observation()
+            val radio = radioObservations[info.subscriptionId]?.takeIf {
+                SystemClock.elapsedRealtime() - it.observedAtElapsed <= RADIO_OBSERVATION_TTL_MS
+            }
             SimLine(
                 subId = info.subscriptionId,
                 slotIndex = info.simSlotIndex,
                 displayName = info.displayName?.toString().orEmpty(),
                 carrierName = info.carrierName?.toString().orEmpty(),
                 signalLevel = o.level,
-                dbm = o.dbm,
+                dbm = radio?.referenceDbm ?: o.dbm,
                 inService = o.inService,
                 serviceStateKnown = o.serviceStateKnown,
-                networkType = o.networkType,
+                networkType = radio?.technology ?: o.networkType,
+                radio = radio,
             )
         }
         AppState.update {
@@ -158,11 +164,26 @@ class SimRepository(
         return lines
     }
 
+    /** Must be called away from the main thread. NetMonster performs synchronous telephony reads. */
+    fun refreshRadioDetails(activeSubIds: Set<Int>): Result<RadioRefreshResult> =
+        radioSource.read(activeSubIds).map { metrics ->
+            val before = activeSubIds.associateWith { radioObservations[it]?.withoutTimestamp() }
+            activeSubIds.forEach(radioObservations::remove)
+            radioObservations.putAll(metrics)
+            val after = activeSubIds.associateWith { radioObservations[it]?.withoutTimestamp() }
+            RadioRefreshResult(metrics, before != after)
+        }
+
+    fun clearRadioDetails() {
+        radioObservations.clear()
+    }
+
     @Synchronized
     fun pause() {
         paused.set(true)
         unregister()
         observations.clear()
+        radioObservations.clear()
     }
 
     fun resume() {
@@ -195,4 +216,19 @@ class SimRepository(
             else -> "—"
         }
     }
+
+    private fun RadioMetrics.withoutTimestamp(): RadioMetrics = copy(
+        observedAtElapsed = 0L,
+        cells = cells.map { it.copy(sourceTimestamp = null) },
+    )
+
+    companion object {
+        private const val RADIO_OBSERVATION_TTL_MS = 45_000L
+        private val radioObservations = ConcurrentHashMap<Int, RadioMetrics>()
+    }
 }
+
+data class RadioRefreshResult(
+    val metrics: Map<Int, RadioMetrics>,
+    val materiallyChanged: Boolean,
+)
