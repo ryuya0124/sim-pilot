@@ -14,11 +14,15 @@ filenames=(sim-pilot-current.jsonl)
 for index in $(seq 1 16); do
   filenames+=("sim-pilot.$index.jsonl.gz" "sim-pilot.$index.jsonl")
 done
-for filename in "${filenames[@]}"; do
-  if "${adb_command[@]}" shell run-as dev.simpilot test -f "$device_directory/$filename"; then
-    "${adb_command[@]}" exec-out run-as dev.simpilot cat "$device_directory/$filename" > "$output_dir/$filename"
-  fi
-done
+if "${adb_command[@]}" shell run-as dev.simpilot test -d "$device_directory" 2>/dev/null; then
+  for filename in "${filenames[@]}"; do
+    if "${adb_command[@]}" shell run-as dev.simpilot test -f "$device_directory/$filename"; then
+      "${adb_command[@]}" exec-out run-as dev.simpilot cat "$device_directory/$filename" > "$output_dir/$filename"
+    fi
+  done
+else
+  echo "SIM Pilot is not debuggable; skipping app-private JSONL files." >&2
+fi
 
 "${adb_command[@]}" shell dumpsys package dev.simpilot > "$output_dir/package.txt"
 "${adb_command[@]}" shell dumpsys activity services dev.simpilot > "$output_dir/service.txt"
